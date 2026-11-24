@@ -120,7 +120,10 @@ pub fn recognize_lines(img: &Image, lang: &str) -> Result<Vec<Line>, String> {
     let run = || -> windows_core::Result<Vec<Line>> {
         let eng = engine(lang)?;
         let max = OcrEngine::MaxImageDimension().unwrap_or(10000);
+        let src_w = img.w;
         let img = prepare(img, max);
+        // Word boxes come back in the prepared image's pixels; report them in the caller's.
+        let k = src_w as f32 / img.w.max(1) as f32;
         let w = DataWriter::new()?;
         w.WriteBytes(&img.px)?;
         let buf = w.DetachBuffer()?;
@@ -135,7 +138,7 @@ pub fn recognize_lines(img: &Image, lang: &str) -> Result<Vec<Line>, String> {
             for j in 0..ws.Size()? {
                 let wd = ws.GetAt(j)?;
                 let r = wd.BoundingRect()?;
-                words.push(Word { text: wd.Text()?.to_string(), x: r.X, y: r.Y, w: r.Width, h: r.Height });
+                words.push(Word { text: wd.Text()?.to_string(), x: r.X * k, y: r.Y * k, w: r.Width * k, h: r.Height * k });
             }
             if !words.is_empty() {
                 out.push(Line { words });
@@ -148,6 +151,144 @@ pub fn recognize_lines(img: &Image, lang: &str) -> Result<Vec<Line>, String> {
         Err(e) if e.code().0 == 0 => Err("No OCR language is installed (Settings › Time & language › Language)".into()),
         Err(e) => Err(format!("Text recognition failed: {}", e.message())),
     }
+}
+
+/// What smart redaction hides.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Secret {
+    Email,
+    Number,
+    Key,
+}
+
+const PHONE_CHARS: &str = "+-().";
+
+/// The address inside a word ("From:jane@x.com" → "jane@x.com"), as a char range.
+fn email_span(t: &str) -> Option<(usize, usize)> {
+    let chars: Vec<char> = t.chars().collect();
+    let at = chars.iter().position(|c| *c == '@')?;
+    let local = |c: &char| c.is_alphanumeric() || "._%+-".contains(*c);
+    let mut a = at;
+    while a > 0 && local(&chars[a - 1]) {
+        a -= 1;
+    }
+    let mut b = at + 1;
+    while b < chars.len() && (chars[b].is_alphanumeric() || chars[b] == '.' || chars[b] == '-') {
+        b += 1;
+    }
+    while b > at + 1 && chars[b - 1] == '.' {
+        b -= 1;
+    }
+    let host: String = chars[at + 1..b].iter().collect();
+    (a < at && host.contains('.') && !host.starts_with('.')).then_some((a, b))
+}
+
+#[cfg(test)]
+fn is_email(t: &str) -> bool {
+    email_span(t).is_some()
+}
+
+/// The key inside a word ("KEY=sk-…" → "sk-…"), as a char range.
+fn key_span(t: &str) -> Option<(usize, usize)> {
+    let chars: Vec<char> = t.chars().collect();
+    let mut a = chars.iter().rposition(|c| *c == '=' || *c == ':').map(|i| i + 1).unwrap_or(0);
+    // Keep trailing '=' padding (base64) with the value.
+    if a > 0 && a == chars.len() {
+        a = 0;
+    }
+    let trim = |c: char| matches!(c, '"' | '\'' | ',' | ';' | '(' | ')' | '[' | ']' | '<' | '>');
+    while a < chars.len() && trim(chars[a]) {
+        a += 1;
+    }
+    let mut b = chars.len();
+    while b > a && trim(chars[b - 1]) {
+        b -= 1;
+    }
+    let v: String = chars[a..b].iter().collect();
+    is_key(&v).then_some((a, b))
+}
+
+/// API keys, tokens, passwords-looking strings: long, mixed letters and digits, or a known prefix.
+fn is_key(t: &str) -> bool {
+    let t = t.trim_matches(|c: char| matches!(c, '"' | '\'' | ',' | ';' | '(' | ')' | '[' | ']' | '<' | '>'));
+    // "KEY=value" / "token: value": judge the value.
+    let t = t.rsplit(['=', ':']).next().unwrap_or(t);
+    let prefixes = ["sk-", "sk_live_", "sk_test_", "pk_live_", "rk_live_", "ghp_", "gho_", "ghs_", "github_pat_", "glpat-", "xoxb-", "xoxp-", "AKIA", "ASIA", "AIza", "eyJ", "hf_", "npm_"];
+    let ok_chars = t.chars().all(|c| c.is_ascii_alphanumeric() || "-_./+=".contains(c));
+    if !ok_chars {
+        return false;
+    }
+    if t.len() >= 16 && prefixes.iter().any(|p| t.starts_with(p)) {
+        return true;
+    }
+    if t.len() < 20 || t.contains("://") || t.starts_with("www.") {
+        return false;
+    }
+    let letters = t.chars().filter(|c| c.is_ascii_alphabetic()).count();
+    let digits = t.chars().filter(|c| c.is_ascii_digit()).count();
+    let upper = t.chars().any(|c| c.is_ascii_uppercase());
+    let lower = t.chars().any(|c| c.is_ascii_lowercase());
+    // Long hex (hashes, secrets) or a random-looking mix. Plain words and paths don't qualify.
+    let hex = t.len() >= 32 && t.chars().all(|c| c.is_ascii_hexdigit());
+    hex || (letters >= 4 && digits >= 3 && (upper && lower || digits * 4 >= t.len()) && !t.contains('/'))
+}
+
+/// Phone, card and account numbers: a run of words made only of digits and phone punctuation,
+/// 9-19 digits in total (dates and times have fewer). Returns word index ranges.
+fn number_runs(words: &[Word]) -> Vec<(usize, usize)> {
+    let numberish = |t: &str| t.chars().any(|c| c.is_ascii_digit()) && t.chars().all(|c| c.is_ascii_digit() || PHONE_CHARS.contains(c));
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < words.len() {
+        if !numberish(&words[i].text) {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j + 1 < words.len() && numberish(&words[j + 1].text) {
+            j += 1;
+        }
+        let digits: usize = words[i..=j].iter().map(|w| w.text.chars().filter(|c| c.is_ascii_digit()).count()).sum();
+        if (9..=19).contains(&digits) {
+            out.push((i, j));
+        }
+        i = j + 1;
+    }
+    out
+}
+
+/// Boxes (x, y, w, h, what) around emails, phone/card numbers and keys, padded a little.
+pub fn find_secrets(lines: &[Line]) -> Vec<(f32, f32, f32, f32, Secret)> {
+    let mut out = Vec::new();
+    let pad = |x: f32, y: f32, w: f32, h: f32, s: Secret| {
+        let p = (h * 0.2).max(2.0);
+        (x - p, y - p, w + p * 2.0, h + p * 2.0, s)
+    };
+    for l in lines {
+        let mut taken = vec![false; l.words.len()];
+        for (i, wd) in l.words.iter().enumerate() {
+            let what = email_span(&wd.text).map(|r| (r, Secret::Email)).or_else(|| key_span(&wd.text).map(|r| (r, Secret::Key)));
+            if let Some(((a, b), s)) = what {
+                taken[i] = true;
+                // Cover just that part of the word (assumes even character widths, plus a margin).
+                let n = wd.text.chars().count().max(1) as f32;
+                let (x0, x1) = (wd.x + wd.w * (a as f32 - 0.5).max(0.0) / n, wd.x + wd.w * (b as f32 + 0.5).min(n) / n);
+                out.push(pad(x0, wd.y, x1 - x0, wd.h, s));
+            }
+        }
+        for (a, b) in number_runs(&l.words) {
+            if taken[a..=b].iter().any(|t| *t) {
+                continue;
+            }
+            let ws = &l.words[a..=b];
+            let x0 = ws.iter().map(|w| w.x).fold(f32::MAX, f32::min);
+            let y0 = ws.iter().map(|w| w.y).fold(f32::MAX, f32::min);
+            let x1 = ws.iter().map(|w| w.x + w.w).fold(f32::MIN, f32::max);
+            let y1 = ws.iter().map(|w| w.y + w.h).fold(f32::MIN, f32::max);
+            out.push(pad(x0, y0, x1 - x0, y1 - y0, Secret::Number));
+        }
+    }
+    out
 }
 
 fn median(mut v: Vec<f32>) -> f32 {
@@ -379,6 +520,36 @@ mod tests {
         assert_eq!(layout(&lines, crate::config::TextLayout::Paragraphs), "Hello world again\nNew");
         assert_eq!(layout(&lines, crate::config::TextLayout::SingleLine), "Hello wor- ld again New");
     }
+    fn wline(words: &[&str]) -> Line {
+        Line { words: words.iter().enumerate().map(|(i, t)| Word { text: t.to_string(), x: i as f32 * 100.0, y: 10.0, w: 90.0, h: 20.0 }).collect() }
+    }
+
+    #[test]
+    fn finds_secrets() {
+        let kinds = |ws: &[&str]| find_secrets(&[wline(ws)]).into_iter().map(|s| s.4).collect::<Vec<_>>();
+        assert_eq!(kinds(&["Mail", "me:", "jane.doe@example.com", "today"]), vec![Secret::Email]);
+        assert!(is_email("<jane@example.co.uk>,") && !is_email("@handle") && !is_email("a@b"));
+        // Only the address part of "From:jane@x.com" is covered.
+        let s = find_secrets(&[wline(&["From:jane@example.com"])]);
+        assert!(s[0].0 > 15.0 && s[0].0 < 30.0, "{:?}", s[0]);
+        let s = find_secrets(&[wline(&["KEY=ghp_16C7e42F292c6912E7710c838347Ae178B4a"])]);
+        assert!(s[0].0 > 0.0 && s[0].0 < 15.0, "{:?}", s[0]);
+        assert_eq!(kinds(&["Call", "+44", "20", "7946", "0958"]), vec![Secret::Number]);
+        assert_eq!(kinds(&["Card", "4111", "1111", "1111", "1111"]), vec![Secret::Number]);
+        assert_eq!(kinds(&["OPENAI_KEY=sk-proj-Ab12Cd34Ef56Gh78"]), vec![Secret::Key]);
+        assert_eq!(kinds(&["token", "ghp_16C7e42F292c6912E7710c838347Ae178B4a"]), vec![Secret::Key]);
+        assert_eq!(kinds(&["sha", "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"]), vec![Secret::Key]);
+        // Ordinary text, dates, times, versions, URLs and paths stay visible.
+        assert!(kinds(&["Meeting", "on", "2026-11-24", "at", "10:30"]).is_empty());
+        assert!(kinds(&["Version", "1.2.3", "released", "with", "42", "fixes"]).is_empty());
+        assert!(kinds(&["https://github.com/JustSad42/framegrab/releases/latest"]).is_empty());
+        assert!(kinds(&["internationalization", "Characteristically"]).is_empty());
+        // The box covers all words of a split number.
+        let s = find_secrets(&[wline(&["+1", "555", "010", "9999"])]);
+        assert_eq!(s.len(), 1);
+        assert!(s[0].0 < 0.0 && s[0].0 + s[0].2 > 390.0);
+    }
+
     #[test]
     fn single_items() {
         assert_eq!(single_item("https://exa mple.com/a?b=1"), Some((Kind::Link, "https://example.com/a?b=1".into())));
@@ -420,5 +591,22 @@ mod tests {
         assert_eq!(table(&lines).as_deref(), Some("Name\tPrice\nApple\t1.20\nPear\t0.90"));
         let prose = vec![line(&[("just", 0.0, 0.0), ("words", 40.0, 0.0)]), line(&[("more", 0.0, 20.0), ("text", 40.0, 20.0)])];
         assert_eq!(table(&prose), None);
+    }
+}
+#[cfg(test)]
+mod live {
+    /// FRAMEGRAB_REDACT_IMG=<png> cargo test --release redact_live -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn redact_live() {
+        let p = std::env::var("FRAMEGRAB_REDACT_IMG").expect("FRAMEGRAB_REDACT_IMG");
+        let img = crate::output::read_png(std::path::Path::new(&p)).unwrap();
+        let lines = super::recognize_lines(&img, "").unwrap();
+        for l in &lines {
+            println!("line: {}", l.words.iter().map(|w| format!("{}[{:.0},{:.0} {:.0}x{:.0}]", w.text, w.x, w.y, w.w, w.h)).collect::<Vec<_>>().join(" "));
+        }
+        for s in super::find_secrets(&lines) {
+            println!("secret: {:?} at {:.0},{:.0} {:.0}x{:.0}", s.4, s.0, s.1, s.2, s.3);
+        }
     }
 }

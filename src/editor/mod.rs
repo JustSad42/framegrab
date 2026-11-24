@@ -146,6 +146,8 @@ struct Editor {
     closing: bool,
     /// Test hook: FRAMEGRAB_EDITOR_DEMO=<dir> adds sample shapes, screenshots the window, exits.
     demo: Option<(PathBuf, u32)>,
+    /// Smart redaction running in the background (OCR of the base image).
+    redacting: Option<std::sync::mpsc::Receiver<Result<Vec<(f32, f32, f32, f32, crate::ocr::Secret)>, String>>>,
 }
 
 pub fn run(path: PathBuf, out: Option<PathBuf>) {
@@ -221,6 +223,7 @@ impl Editor {
             ask_close: false,
             closing: false,
             demo: std::env::var_os("FRAMEGRAB_EDITOR_DEMO").map(|d| (PathBuf::from(d), 0)),
+            redacting: None,
         }
     }
 
@@ -543,6 +546,10 @@ impl Editor {
                 self.do_redo();
             }
             separator(ui);
+            let busy = self.redacting.is_some();
+            if icon_button(ui, "\u{E224}", busy, "Smart redact: pixelate emails, phone/card numbers and keys  (X)").clicked() {
+                self.start_redact(ui.ctx(), now);
+            }
             let tip = if self.beautify { "Beautify is on: background, padding, rounded corners and shadow are added when saving  (F)\nStyle and default: Settings" } else { "Beautify: add a background, padding, rounded corners and shadow  (F)" };
             if icon_button(ui, "\u{E6A2}", self.beautify, tip).clicked() {
                 self.beautify = !self.beautify;
@@ -562,6 +569,66 @@ impl Editor {
                 }
             });
         });
+    }
+
+    /// Smart redaction: reads the image and pixelates emails, phone/card numbers and keys.
+    fn start_redact(&mut self, ctx: &egui::Context, now: f64) {
+        if self.redacting.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let img = self.base.clone();
+        let lang = self.cfg.ocr_language.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let r = crate::ocr::recognize_lines(&img, &lang).map(|l| crate::ocr::find_secrets(&l));
+            let _ = tx.send(r);
+            ctx.request_repaint();
+        });
+        self.redacting = Some(rx);
+        self.status = Some(("Looking for emails, numbers and keys…".into(), now));
+    }
+
+    fn poll_redact(&mut self, now: f64) {
+        let Some(rx) = &self.redacting else { return };
+        let Ok(res) = rx.try_recv() else { return };
+        self.redacting = None;
+        match res {
+            Ok(found) => {
+                let (bw, bh) = (self.base.w as f32, self.base.h as f32);
+                // Skip anything already covered by a pixelate box.
+                let covered = |r: Rect, shapes: &[Shape]| shapes.iter().any(|s| s.kind == Kind::Blur && Rect::from_two_pos(s.a, s.b).expand(2.0).contains_rect(r));
+                let mut add = Vec::new();
+                for (x, y, w, h, _) in &found {
+                    let r = Rect::from_min_max(pos2(x.max(0.0), y.max(0.0)), pos2((x + w).min(bw), (y + h).min(bh)));
+                    if r.width() >= 2.0 && r.height() >= 2.0 && !covered(r, &self.shapes) {
+                        add.push(r);
+                    }
+                }
+                if add.is_empty() {
+                    self.status = Some(("Nothing sensitive found".into(), now));
+                    return;
+                }
+                self.snapshot();
+                for r in &add {
+                    let mut s = self.new_shape(Kind::Blur, r.min);
+                    s.b = r.max;
+                    self.shapes.push(s);
+                }
+                self.dirty = true;
+                let count = |k| found.iter().filter(|f| f.4 == k).count();
+                let mut parts = Vec::new();
+                for (k, one, many) in [(crate::ocr::Secret::Email, "email", "emails"), (crate::ocr::Secret::Number, "number", "numbers"), (crate::ocr::Secret::Key, "key", "keys")] {
+                    match count(k) {
+                        0 => {}
+                        1 => parts.push(format!("1 {one}")),
+                        n => parts.push(format!("{n} {many}")),
+                    }
+                }
+                self.status = Some((format!("Pixelated {} · Ctrl+Z to undo", parts.join(", ")), now));
+            }
+            Err(e) => self.status = Some((e, now)),
+        }
     }
 
     fn set_color(&mut self, c: Color32) {
@@ -604,6 +671,9 @@ impl Editor {
                     self.selected = None;
                 }
             }
+        }
+        if !cmd && pressed(egui::Key::X) {
+            self.start_redact(ctx, now);
         }
         if pressed(egui::Key::Delete) || pressed(egui::Key::Backspace) {
             if let Some(i) = self.selected.take() {
@@ -1155,9 +1225,20 @@ impl eframe::App for Editor {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let now = ctx.input(|i| i.time);
+        self.poll_redact(now);
         if let Some((dir, n)) = self.demo.clone() {
             if n == 0 {
-                self.demo_shapes();
+                if std::env::var_os("FRAMEGRAB_EDITOR_REDACT").is_some() {
+                    self.start_redact(&ctx, now);
+                } else {
+                    self.demo_shapes();
+                }
+            }
+            // Wait for redaction before taking the demo screenshot.
+            if self.redacting.is_some() {
+                self.demo = Some((dir, n.max(1)));
+                ctx.request_repaint();
+                return;
             }
             if n == 8 {
                 let slot = DEMO_SHOT.clone();
