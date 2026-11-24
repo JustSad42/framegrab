@@ -597,6 +597,12 @@ fn toast_action(a: Action) {
                 crate::pin::pin(img, at);
             }
         }
+        Action::Trim => {
+            if let Some(p) = toast::path() {
+                spawn_self(&["--trim", &p.to_string_lossy()]);
+            }
+            toast::dismiss();
+        }
         Action::Folder => {
             if let Some(p) = toast::path() {
                 reveal(&p);
@@ -945,7 +951,7 @@ fn handle_jobs() {
                     Ok((path, thumb)) => {
                         let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                         let detail = if size > 10 << 20 { format!("{:.0} MB", size as f64 / 1048576.0) } else { format!("{:.1} MB", size as f64 / 1048576.0) };
-                        toast::show(host, Content::Video { thumb, status: "Recording saved".into(), detail }, Some(path), cfg.toolbar_seconds.max(5));
+                        toast::show(host, Content::Video { thumb, status: "Recording saved".into(), detail, trim: path.extension().is_some_and(|e| e.eq_ignore_ascii_case("mp4")) }, Some(path), cfg.toolbar_seconds.max(5));
                     }
                     Err(e) => notify(host, "Recording failed", &e),
                 }

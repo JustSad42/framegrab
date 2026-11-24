@@ -24,6 +24,7 @@ mod scroll;
 mod settings;
 mod snap;
 mod toast;
+mod trim;
 mod translate;
 mod ui;
 mod updater;
@@ -41,6 +42,10 @@ fn main() {
 
     if let Some(p) = after("--edit") {
         editor::run(std::path::PathBuf::from(p), after("--out").map(std::path::PathBuf::from));
+        return;
+    }
+    if let Some(p) = after("--trim") {
+        trim::run(std::path::PathBuf::from(p));
         return;
     }
     if has("--settings") {

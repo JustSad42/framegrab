@@ -21,6 +21,7 @@ pub enum Action {
     Close = 6,
     Upload = 7,
     Pin = 8,
+    Trim = 9,
 }
 
 impl Action {
@@ -34,6 +35,7 @@ impl Action {
             6 => Action::Close,
             7 => Action::Upload,
             8 => Action::Pin,
+            9 => Action::Trim,
             _ => return None,
         })
     }
@@ -42,7 +44,8 @@ impl Action {
 pub enum Content {
     Image { thumb: Image, size: (u32, u32), status: String, upload: bool },
     Text { text: String, status: String },
-    Video { thumb: Option<Image>, status: String, detail: String },
+    /// `trim`: an MP4 (offers Trim / read text).
+    Video { thumb: Option<Image>, status: String, detail: String, trim: bool },
 }
 
 struct Toast {
@@ -211,12 +214,13 @@ fn layout(t: &Toast) -> Vec<(Action, Rect)> {
         Content::Image { upload: true, .. } => &[Action::Edit, Action::Text, Action::Copy, Action::Pin, Action::Upload, Action::Folder, Action::Delete],
         Content::Image { .. } => &[Action::Edit, Action::Text, Action::Copy, Action::Pin, Action::Folder, Action::Delete],
         Content::Text { .. } => &[Action::Copy],
+        Content::Video { trim: true, .. } => &[Action::Folder, Action::Trim, Action::Delete],
         Content::Video { .. } => &[Action::Folder, Action::Delete],
     };
     let wide = if matches!(t.content, Content::Text { .. }) { (120.0 * s) as i32 } else if matches!(t.content, Content::Video { .. }) { (140.0 * s) as i32 } else { (88.0 * s) as i32 };
     let mut x = pad;
     for (i, a) in acts.iter().enumerate() {
-        let w = if i == 0 { wide } else if matches!(a, Action::Text) { (74.0 * s) as i32 } else { bh + (6.0 * s) as i32 };
+        let w = if i == 0 { wide } else if matches!(a, Action::Text | Action::Trim) { (74.0 * s) as i32 } else { bh + (6.0 * s) as i32 };
         out.push((*a, Rect::new(x, y, w, bh)));
         x += w + gap;
     }
@@ -287,6 +291,7 @@ fn paint(t: &mut Toast) {
             Action::Delete => (icon::TRASH, ""),
             Action::Upload => (icon::UPLOAD, ""),
             Action::Pin => (icon::PIN, ""),
+            Action::Trim => (icon::SCISSORS, "Trim"),
             Action::Close => (icon::X, ""),
         };
         if *a == Action::Close {

@@ -9,6 +9,35 @@ pub struct Mp4 {
     a: Option<u32>,
     pub width: u32,
     pub height: u32,
+    api: Option<ICodecAPI>,
+    fps: u32,
+    frames: std::cell::Cell<u64>,
+}
+
+fn u4(n: u32) -> windows::Win32::System::Variant::VARIANT {
+    let mut v = windows::Win32::System::Variant::VARIANT::default();
+    unsafe {
+        let inner = &mut *v.Anonymous.Anonymous;
+        inner.vt = windows::Win32::System::Variant::VT_UI4;
+        inner.Anonymous.ulVal = n;
+    }
+    v
+}
+
+/// The encoder's settings interface, with a one-second GOP requested. Encoders often ignore the
+/// GOP size once streaming, so `video` also forces a keyframe every second.
+fn codec_api(w: &IMFSinkWriter, stream: u32, fps: u32) -> Option<ICodecAPI> {
+    use windows_core::Interface;
+    unsafe {
+        let mut p: *mut core::ffi::c_void = std::ptr::null_mut();
+        w.GetServiceForStream(stream, &windows_core::GUID::zeroed(), &ICodecAPI::IID, &mut p).ok()?;
+        if p.is_null() {
+            return None;
+        }
+        let api = ICodecAPI::from_raw(p);
+        let _ = api.SetValue(&CODECAPI_AVEncMPVGOPSize, &u4(fps.max(1)));
+        Some(api)
+    }
 }
 
 fn pack(a: u32, b: u32) -> u64 {
@@ -38,6 +67,8 @@ impl Mp4 {
             out.SetUINT64(&MF_MT_FRAME_SIZE, pack(width, height))?;
             out.SetUINT64(&MF_MT_FRAME_RATE, pack(fps, 1))?;
             out.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack(1, 1))?;
+            // A keyframe every second: trims (which cut at keyframes) land close to where you want.
+            out.SetUINT32(&MF_MT_MAX_KEYFRAME_SPACING, fps.max(1))?;
             let v = w.AddStream(&out)?;
 
             let inp = MFCreateMediaType()?;
@@ -49,6 +80,7 @@ impl Mp4 {
             inp.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack(1, 1))?;
             inp.SetUINT32(&MF_MT_DEFAULT_STRIDE, width)?;
             w.SetInputMediaType(v, &inp, None)?;
+            let api = codec_api(&w, v, fps);
 
             let a = if audio {
                 let out = MFCreateMediaType()?;
@@ -74,7 +106,7 @@ impl Mp4 {
                 None
             };
             w.BeginWriting()?;
-            Ok(Mp4 { w, v, a, width, height })
+            Ok(Mp4 { w, v, a, width, height, api, fps, frames: Default::default() })
         }
     }
 
@@ -96,6 +128,13 @@ impl Mp4 {
 
     /// NV12 frame at `t` (100 ns units).
     pub fn video(&self, nv12: &[u8], t: i64, dur: i64) -> windows_core::Result<()> {
+        let n = self.frames.get();
+        self.frames.set(n + 1);
+        if n > 0 && n % self.fps.max(1) as u64 == 0 {
+            if let Some(api) = &self.api {
+                let _ = unsafe { api.SetValue(&CODECAPI_AVEncVideoForceKeyFrame, &u4(1)) };
+            }
+        }
         self.write(self.v, nv12, t, dur)
     }
 

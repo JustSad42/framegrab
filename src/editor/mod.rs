@@ -1163,12 +1163,12 @@ fn dist_seg(p: Pos2, a: Pos2, b: Pos2) -> f32 {
     p.distance(a + ab * t)
 }
 
-fn separator(ui: &mut egui::Ui) {
+pub(crate) fn separator(ui: &mut egui::Ui) {
     let (r, _) = ui.allocate_exact_size(vec2(13.0, 30.0), Sense::hover());
     ui.painter().line_segment([pos2(r.center().x, r.top() + 6.0), pos2(r.center().x, r.bottom() - 6.0)], Stroke::new(1.0, BORDER));
 }
 
-fn icon_button(ui: &mut egui::Ui, icon: &str, active: bool, tip: &str) -> egui::Response {
+pub(crate) fn icon_button(ui: &mut egui::Ui, icon: &str, active: bool, tip: &str) -> egui::Response {
     let (r, resp) = ui.allocate_exact_size(vec2(34.0, 34.0), Sense::click());
     let bg = if active {
         Some(ACCENT.gamma_multiply(0.28))
@@ -1201,7 +1201,7 @@ fn icon_button(ui: &mut egui::Ui, icon: &str, active: bool, tip: &str) -> egui::
     resp.on_hover_text(tip)
 }
 
-fn text_button(ui: &mut egui::Ui, icon: &str, label: &str) -> egui::Response {
+pub(crate) fn text_button(ui: &mut egui::Ui, icon: &str, label: &str) -> egui::Response {
     let font = egui::FontId::proportional(13.5);
     let tw = ui.fonts_mut(|f| f.layout_no_wrap(label.to_string(), font.clone(), TEXT).size().x);
     let (r, resp) = ui.allocate_exact_size(vec2(tw + 46.0, 34.0), Sense::click());
@@ -1211,7 +1211,7 @@ fn text_button(ui: &mut egui::Ui, icon: &str, label: &str) -> egui::Response {
     resp
 }
 
-fn primary_button(ui: &mut egui::Ui, icon: &str, label: &str) -> egui::Response {
+pub(crate) fn primary_button(ui: &mut egui::Ui, icon: &str, label: &str) -> egui::Response {
     let font = ui::bold(13.5);
     let tw = ui.fonts_mut(|f| f.layout_no_wrap(label.to_string(), font.clone(), TEXT).size().x);
     let (r, resp) = ui.allocate_exact_size(vec2(tw + 50.0, 34.0), Sense::click());

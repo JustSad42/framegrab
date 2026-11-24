@@ -780,7 +780,22 @@ impl eframe::App for Settings {
                         toggle(ui, &mut c.rec_cursor, "Show the mouse pointer", "");
                         ui.separator();
                         let d = Config { rec_dir: String::new(), ..c.clone() }.recordings_dir();
+                        let d2 = c.recordings_dir();
                         folder_row(ui, "Recordings folder", &mut c.rec_dir, d);
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new("Trim a video or read text from it").color(TEXT));
+                                hint(ui, "Open any MP4: cut the start and end without re-encoding, or pause on a frame and copy its text. Recordings also have a Trim button.");
+                            });
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.button("Open video…").clicked() {
+                                    if let Some(p) = rfd::FileDialog::new().set_directory(&d2).add_filter("Video", &["mp4", "m4v", "mov"]).pick_file() {
+                                        crate::app::spawn_self(&["--trim", &p.to_string_lossy()]);
+                                    }
+                                }
+                            });
+                        });
                     }),
                     6 => card(ui, "", |ui| self.text_grab(ui)),
                     7 => card(ui, "", |ui| self.uploads(ui)),
