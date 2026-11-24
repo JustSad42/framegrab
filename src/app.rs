@@ -87,6 +87,31 @@ pub fn is_idle() -> bool {
 
 const TIMER_SCROLL: usize = 10;
 const TIMER_REC: usize = 11;
+const TIMER_TRIM: usize = 12;
+
+/// After a capture: once everything is closed, drop the cached image and hand memory back.
+fn schedule_trim() {
+    if let Some(h) = with(|a| a.host) {
+        unsafe {
+            SetTimer(Some(h), TIMER_TRIM, 2000, None);
+        }
+    }
+}
+
+fn trim_tick(h: HWND) {
+    if !is_idle() {
+        return;
+    }
+    unsafe {
+        let _ = KillTimer(Some(h), TIMER_TRIM);
+    }
+    with(|a| a.last = None);
+    overlay::release_memory();
+    unsafe {
+        use windows::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
+        let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+    }
+}
 
 pub fn run(background: bool) {
     unsafe {
@@ -334,6 +359,7 @@ fn start_overlay(mode: Mode, cfg: &Config) {
 
 fn overlay_done() {
     hook::ROUTE.store(false, Relaxed);
+    schedule_trim();
     let Some(done) = overlay::take_result() else {
         with(|a| a.busy = Busy::Idle);
         return;
@@ -374,6 +400,7 @@ fn jobs_tx() -> Option<JobTx> {
 
 /// Clipboard + save + toolbar for a finished image.
 fn deliver(img: Image) {
+    schedule_trim();
     let Some((cfg, host)) = with(|a| (a.cfg.clone(), a.host)) else { return };
     if cfg.copy_to_clipboard {
         output::copy_image(&img);
@@ -762,6 +789,7 @@ fn handle_jobs() {
             }
             Job::Ocr(Err(e)) => toast::show(host, Content::Text { text: e, status: "Couldn't read text".into() }, None, cfg.toolbar_seconds.max(4)),
             Job::RecDone(res) => {
+                schedule_trim();
                 with(|a| {
                     if matches!(a.busy, Busy::Finishing) {
                         a.busy = Busy::Idle;
@@ -801,6 +829,29 @@ fn copydata(s: &str) {
         "dump" => {
             let files = overlay::dump(std::path::Path::new(rest));
             let _ = std::fs::write(std::path::Path::new(rest).join("dump.txt"), files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n"));
+        }
+        "dxgi-compare" => {
+            let dir = std::path::PathBuf::from(rest);
+            let mons = capture::monitors();
+            let t = std::time::Instant::now();
+            let gdi: Vec<Image> = mons.iter().map(|m| capture::grab(m.rect, false)).collect();
+            let tg = t.elapsed().as_millis();
+            let t = std::time::Instant::now();
+            let dx = crate::dxgi::grab_monitors(&mons);
+            let td = t.elapsed().as_millis();
+            let t = std::time::Instant::now();
+            let dx2 = crate::dxgi::grab_monitors(&mons);
+            let td2 = t.elapsed().as_millis();
+            let mut rep = format!("gdi {tg} ms, dxgi {td} ms, dxgi again {td2} ms, ok={}\n", dx2.is_some());
+            if let Some(dx) = dx {
+                for (i, (a, b)) in gdi.iter().zip(&dx).enumerate() {
+                    let same = a.w == b.w && a.h == b.h;
+                    let diff = if same { a.px.chunks_exact(4).zip(b.px.chunks_exact(4)).filter(|(p, q)| p[..3] != q[..3]).count() } else { usize::MAX };
+                    rep += &format!("mon {i} {:?} gdi {}x{} dxgi {}x{} differing px {}\n", mons[i].rect, a.w, a.h, b.w, b.h, diff);
+                    let _ = output::write_png(&dir.join(format!("dx-{i}.png")), &b.fit(960, 960), true);
+                }
+            }
+            let _ = std::fs::write(dir.join("dxgi.txt"), rep);
         }
         "deliver-test" => {
             // Shows the toolbar for an existing PNG.
@@ -907,6 +958,7 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 match wp.0 {
                     TIMER_SCROLL => scroll_tick(),
                     TIMER_REC => rec_tick(),
+                    TIMER_TRIM => trim_tick(h),
                     crate::updater::TIMER_ID => crate::updater::on_timer(h),
                     _ => {}
                 }

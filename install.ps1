@@ -19,8 +19,10 @@ $exe = Join-Path $dir "Framegrab.exe"
 New-Item -ItemType Directory -Force $dir | Out-Null
 
 # Stop the running copy (and any editor/settings windows) so the file can be replaced.
-Get-Process Framegrab -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $exe } | Stop-Process -Force
-Start-Sleep -Milliseconds 500
+$running = Get-Process Framegrab -ErrorAction SilentlyContinue | Where-Object { $_.Path -ieq $exe }
+$running | Stop-Process -Force
+$running | ForEach-Object { $_.WaitForExit(5000) | Out-Null }
+Start-Sleep -Milliseconds 300
 Copy-Item target\release\framegrab.exe $exe -Force
 
 $lnk = Join-Path ([Environment]::GetFolderPath("Programs")) "Framegrab.lnk"

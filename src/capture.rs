@@ -255,6 +255,56 @@ pub unsafe fn draw_cursor(dc: HDC, ox: i32, oy: i32) {
     }
 }
 
+/// Draws the mouse pointer onto an image whose top-left is at desktop (ox, oy).
+pub fn overlay_cursor(img: &mut Image, ox: i32, oy: i32) {
+    unsafe {
+        let mut ci = CURSORINFO { cbSize: std::mem::size_of::<CURSORINFO>() as u32, ..Default::default() };
+        if GetCursorInfo(&mut ci).is_err() || ci.flags.0 & CURSOR_SHOWING.0 == 0 {
+            return;
+        }
+        let mut ii = ICONINFO::default();
+        if GetIconInfo(ci.hCursor.into(), &mut ii).is_err() {
+            return;
+        }
+        if !ii.hbmMask.is_invalid() {
+            let _ = DeleteObject(ii.hbmMask.into());
+        }
+        if !ii.hbmColor.is_invalid() {
+            let _ = DeleteObject(ii.hbmColor.into());
+        }
+        const N: i32 = 128;
+        let cx = ci.ptScreenPos.x - ii.xHotspot as i32 - ox;
+        let cy = ci.ptScreenPos.y - ii.yHotspot as i32 - oy;
+        let Some(r) = Rect::new(cx, cy, N, N).intersect(&Rect::new(0, 0, img.w as i32, img.h as i32)) else { return };
+        let dc = CreateCompatibleDC(None);
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER { biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32, biWidth: N, biHeight: -N, biPlanes: 1, biBitCount: 32, biCompression: BI_RGB.0, ..Default::default() },
+            ..Default::default()
+        };
+        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        if let Ok(dib) = CreateDIBSection(Some(dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) {
+            let old = SelectObject(dc, dib.into());
+            let buf = std::slice::from_raw_parts_mut(bits as *mut u8, (N * N * 4) as usize);
+            let (dx0, dy0) = (r.x - cx, r.y - cy);
+            for y in 0..r.h {
+                let s = (((r.y + y) as u32 * img.w + r.x as u32) * 4) as usize;
+                let d = (((dy0 + y) * N + dx0) * 4) as usize;
+                buf[d..d + (r.w * 4) as usize].copy_from_slice(&img.px[s..s + (r.w * 4) as usize]);
+            }
+            let _ = DrawIconEx(dc, 0, 0, ci.hCursor.into(), 0, 0, 0, None, DI_NORMAL);
+            let _ = GdiFlush();
+            for y in 0..r.h {
+                let s = (((r.y + y) as u32 * img.w + r.x as u32) * 4) as usize;
+                let d = (((dy0 + y) * N + dx0) * 4) as usize;
+                img.px[s..s + (r.w * 4) as usize].copy_from_slice(&buf[d..d + (r.w * 4) as usize]);
+            }
+            SelectObject(dc, old);
+            let _ = DeleteObject(dib.into());
+        }
+        let _ = DeleteDC(dc);
+    }
+}
+
 /// Bounding box of every monitor.
 pub fn virtual_rect(mons: &[Monitor]) -> Rect {
     let x0 = mons.iter().map(|m| m.rect.x).min().unwrap_or(0);
@@ -273,6 +323,15 @@ pub struct Shot {
 impl Shot {
     pub fn take(cursor: bool) -> Shot {
         let mons = monitors();
+        // GPU path first (DXGI duplication), then GDI.
+        if let Some(mut imgs) = crate::dxgi::grab_monitors(&mons) {
+            if cursor {
+                for (m, img) in mons.iter().zip(imgs.iter_mut()) {
+                    overlay_cursor(img, m.rect.x, m.rect.y);
+                }
+            }
+            return Shot { mons, imgs };
+        }
         // One thread per monitor: BitBlt of several 4K screens is the slowest part of a capture.
         let imgs = std::thread::scope(|s| {
             let hs: Vec<_> = mons.iter().map(|m| { let r = m.rect; s.spawn(move || grab(r, cursor)) }).collect();

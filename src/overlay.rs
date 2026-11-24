@@ -126,8 +126,10 @@ pub fn show_with(mode: Mode, shot: Shot, cfg: &crate::config::Config) {
     let t0 = std::time::Instant::now();
     let to_show = with(|o| {
         o.ensure_windows(&shot);
-        for (w, img) in o.wins.iter_mut().zip(&shot.imgs) {
-            w.upload(img);
+        if std::env::var_os("FRAMEGRAB_NO_UPLOAD").is_none() {
+            for (w, img) in o.wins.iter_mut().zip(&shot.imgs) {
+                w.upload(img);
+            }
         }
         o.s = Some(Session { mode, shot, snaps, cursor, drag: None, dragging: false, hover_btn: None, magnifier: cfg.magnifier, crosshair: cfg.crosshair });
         o.finished = None;
@@ -176,6 +178,19 @@ pub fn take_result() -> Option<Done> {
         let _ = ReleaseCapture();
     }
     Some(res)
+}
+
+/// Frees GPU bitmaps (kept briefly after a capture) and the DXGI devices.
+pub fn release_memory() {
+    with(|o| {
+        if o.s.is_none() {
+            for w in &mut o.wins {
+                w.bmp = None;
+                w.bmp_size = (0, 0);
+            }
+        }
+    });
+    crate::dxgi::release_devices();
 }
 
 pub fn cancel() {

@@ -6,6 +6,7 @@ mod autostart;
 mod bar;
 mod capture;
 mod config;
+mod dxgi;
 mod editor;
 mod gfx;
 mod hook;

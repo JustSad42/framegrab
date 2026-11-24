@@ -135,9 +135,9 @@ pub fn bgra_to_nv12(px: &[u8], w: usize, h: usize, out: &mut Vec<u8>) {
                 for y in 0..n {
                     let src = &px[(r0 + y) * w * 4..(r0 + y + 1) * w * 4];
                     let dst = &mut yb[y * w..(y + 1) * w];
-                    for x in 0..w {
-                        let (b, g, r) = (src[x * 4] as i32, src[x * 4 + 1] as i32, src[x * 4 + 2] as i32);
-                        dst[x] = (((47 * r + 157 * g + 16 * b + 128) >> 8) + 16) as u8;
+                    for (d, p) in dst.iter_mut().zip(src.chunks_exact(4)) {
+                        let (b, g, r) = (p[0] as u32, p[1] as u32, p[2] as u32);
+                        *d = (((47 * r + 157 * g + 16 * b + 128) >> 8) + 16) as u8;
                     }
                 }
                 for cy in 0..n / 2 {

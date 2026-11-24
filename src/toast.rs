@@ -170,6 +170,7 @@ pub fn show(host: HWND, content: Content, path: Option<PathBuf>, seconds: u32) {
                 }
             }
         });
+        hide();
         return;
     }
     unsafe {

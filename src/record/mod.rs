@@ -158,6 +158,12 @@ fn capture_loop(area: Rect, fps: u32, cursor: bool, clock: Arc<Clock>, stop: Arc
     let step = Duration::from_secs_f64(1.0 / fps as f64);
     let mut next = Instant::now();
     let mut last: Option<Duration> = None;
+    // GPU duplication when the area sits on one monitor; GDI otherwise or if it fails.
+    let mut dup = crate::dxgi::open_for(area);
+    let mut buf = Image::new(area.w as u32, area.h as u32);
+    let mut have_frame = false;
+    let mut last_cursor = (i32::MIN, i32::MIN);
+    let mut last_sent = Instant::now();
     while !stop.load(Relaxed) {
         if clock.paused() {
             std::thread::sleep(Duration::from_millis(15));
@@ -170,8 +176,50 @@ fn capture_loop(area: Rect, fps: u32, cursor: bool, clock: Arc<Clock>, stop: Arc
             std::thread::sleep(Duration::from_millis(1));
             continue;
         }
-        let img = capture::grab(area, cursor);
+        let img = match dup.as_mut() {
+            Some(d) => {
+                let wait = next.saturating_duration_since(Instant::now()).as_millis().min(100) as u32;
+                match d.acquire(wait, area) {
+                    Ok(new) => {
+                        // Nothing changed on screen (and the pointer didn't move): skip the frame;
+                        // the previous one simply lasts longer. Keep one frame a second for seeking.
+                        let cur = capture::cursor_pos();
+                        let pointer_moved = cursor && cur != last_cursor;
+                        if !new && have_frame && !pointer_moved && last_sent.elapsed() < Duration::from_secs(1) {
+                            next += step;
+                            let now = Instant::now();
+                            if next > now {
+                                std::thread::sleep(next - now);
+                            } else {
+                                next = now;
+                            }
+                            continue;
+                        }
+                        last_cursor = cur;
+                        if new || !have_frame {
+                            have_frame = d.read(area, &mut buf) || have_frame;
+                        }
+                    }
+                    Err(_) => {
+                        // Lost (mode change, secure desktop): reopen, GDI for this frame.
+                        dup = crate::dxgi::open_for(area);
+                        have_frame = false;
+                    }
+                }
+                if have_frame {
+                    let mut f = buf.clone();
+                    if cursor {
+                        capture::overlay_cursor(&mut f, area.x, area.y);
+                    }
+                    f
+                } else {
+                    capture::grab(area, cursor)
+                }
+            }
+            None => capture::grab(area, cursor),
+        };
         if tx.try_send(Msg::Video(img, t)).is_ok() {
+            last_sent = Instant::now();
             frames.fetch_add(1, Relaxed);
             last = Some(t);
         }
