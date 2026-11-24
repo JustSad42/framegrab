@@ -1,4 +1,5 @@
-//! The resident process: hidden host window, tray icon, hotkey commands and the capture flows.
+//! The resident process: hidden host window (no tray icon), hotkey commands and the capture flows.
+//! Launching Framegrab again opens Settings; Quit and Pause live there.
 
 use crate::bar::{self, Item, Style};
 use crate::capture::{self, Image, Rect, Shot};
@@ -23,10 +24,24 @@ pub fn host_class() -> &'static str {
 }
 
 enum Job {
+    /// Processed capture is on the clipboard; show the card.
+    Ready { raw: Image, thumb: Image, size: (u32, u32), path: Option<PathBuf>, status: String },
     Saved(PathBuf),
-    Ocr(Result<String, String>),
+    Uploaded(Result<String, String>),
+    Ocr(Result<crate::ocr::OcrOut, String>),
     RecDone(Result<(PathBuf, Option<Image>), String>),
     Msg(String),
+}
+
+/// Where a capture came from (file names, window processing, flash).
+#[derive(Default, Clone)]
+pub struct Meta {
+    pub mode: &'static str,
+    /// Clicked window: re-capture it with PrintWindow / transparent corners.
+    pub window: Option<isize>,
+    /// Window the capture is "of" (app name + title).
+    pub app_window: Option<isize>,
+    pub rect: Option<Rect>,
 }
 
 /// Rec-bar button ids.
@@ -69,7 +84,6 @@ struct App {
     jobs_rx: Receiver<Job>,
     /// Last capture shown in the toolbar (for Copy / Text / Edit without re-reading the file).
     last: Option<(Image, Option<PathBuf>)>,
-    taskbar_created: u32,
 }
 
 thread_local! {
@@ -88,6 +102,7 @@ pub fn is_idle() -> bool {
 const TIMER_SCROLL: usize = 10;
 const TIMER_REC: usize = 11;
 const TIMER_TRIM: usize = 12;
+const TIMER_GAME: usize = 13;
 
 /// After a capture: once everything is closed, drop the cached image and hand memory back.
 fn schedule_trim() {
@@ -114,26 +129,34 @@ fn trim_tick(h: HWND) {
 }
 
 pub fn run(background: bool) {
+    let t0 = std::time::Instant::now();
     unsafe {
-        let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
+        // OLE (not just COM) so the toolbar card can start drag-and-drop.
+        let _ = windows::Win32::System::Ole::OleInitialize(None);
     }
     win::register_class(host_class(), Some(wndproc));
     let host = win::create(host_class(), "Framegrab", WS_OVERLAPPED, WS_EX_TOOLWINDOW, 0, 0, 0, 0, None);
     overlay::init(host);
     toast::init();
     bar::init();
+    crate::feedback::init();
+    unsafe {
+        SetTimer(Some(host), TIMER_GAME, 2000, None);
+    }
     let cfg = Config::load();
     let (jobs_tx, jobs_rx) = channel();
-    let taskbar_created = unsafe { RegisterWindowMessageW(PCWSTR(win::wide("TaskbarCreated").as_ptr())) };
-    APP.with(|a| *a.borrow_mut() = Some(App { host, cfg: cfg.clone(), busy: Busy::Idle, jobs_tx, jobs_rx, last: None, taskbar_created }));
+    APP.with(|a| *a.borrow_mut() = Some(App { host, cfg: cfg.clone(), busy: Busy::Idle, jobs_tx, jobs_rx, last: None }));
     apply_config(&cfg);
-    tray_add(host);
+    write_status();
     if !config::test_mode() || std::env::var_os("FRAMEGRAB_HOOK").is_some() {
         hook::start(host);
     }
     crate::updater::spawn_auto(host, cfg.auto_update);
+    log(&format!("started in {} ms", t0.elapsed().as_millis()));
+    // Hand start-up memory back to Windows once things settle; it pages back in on first use.
+    schedule_trim();
     if !background && !config::test_mode() {
-        notify(host, "Framegrab is running", "Press Print Screen or Win+Shift+S to capture.");
+        notify(host, "Framegrab is running", "Press Print Screen to capture. Open Framegrab again for Settings.");
     }
     unsafe {
         let mut msg = MSG::default();
@@ -142,13 +165,60 @@ pub fn run(background: bool) {
             DispatchMessageW(&msg);
         }
     }
-    tray_remove(host);
+}
+
+/// Lets Settings show whether hotkeys are paused (a session switch, not saved).
+fn write_status() {
+    let _ = std::fs::write(config::data_dir().join("status"), if hook::PAUSED.load(Relaxed) { "paused" } else { "running" });
 }
 
 fn apply_config(cfg: &Config) {
-    hook::PRTSC.store(cfg.hook_prtsc, Relaxed);
-    hook::WIN_SHIFT_S.store(cfg.hook_win_shift_s, Relaxed);
+    hook::set_bindings(cfg);
+    if !cfg.pause_in_fullscreen {
+        hook::GAME.store(false, Relaxed);
+    }
     crate::autostart::apply(cfg.start_with_windows);
+}
+
+/// Every 2 s: pause hotkeys while an exclusive full-screen game is in front (if enabled).
+fn game_tick() {
+    if !with(|a| a.cfg.pause_in_fullscreen).unwrap_or(false) {
+        return;
+    }
+    let state = unsafe { SHQueryUserNotificationState() };
+    let game = state.is_ok_and(|s| s == QUNS_RUNNING_D3D_FULL_SCREEN);
+    hook::GAME.store(game, Relaxed);
+}
+
+/// The "choose what to capture" popup (bindable to a hotkey, e.g. Print Screen).
+fn capture_menu(host: HWND) {
+    unsafe {
+        let m = CreatePopupMenu().unwrap_or_default();
+        let hk = with(|a| a.cfg.hotkeys.clone()).unwrap_or_default();
+        let items = [
+            (1usize, "&Snip", hk.snip),
+            (2, "&Full screen", hk.screen),
+            (4, "Active &window", hk.window),
+            (3, "&All monitors", hk.all),
+            (5, "Grab &text", hk.text),
+            (6, "Scrolling &capture", hk.scroll),
+            (7, "&Record screen", hk.record),
+        ];
+        for (id, label, k) in items {
+            let s = if k.is_set() { format!("{label}\t{}", k.label()) } else { label.to_string() };
+            let w = win::wide(&s);
+            let _ = AppendMenuW(m, MF_STRING, id, PCWSTR(w.as_ptr()));
+        }
+        let mut p = POINT::default();
+        let _ = GetCursorPos(&mut p);
+        win::force_foreground(host);
+        let id = TrackPopupMenu(m, TPM_RETURNCMD | TPM_LEFTBUTTON, p.x, p.y, None, host, None);
+        let _ = DestroyMenu(m);
+        if let Some(c) = Cmd::from(id.0 as u32).filter(|c| *c != Cmd::Menu) {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            command(c);
+        }
+    }
 }
 
 pub fn log(msg: &str) {
@@ -158,98 +228,10 @@ pub fn log(msg: &str) {
     }
 }
 
+/// Messages show on the toolbar card (there is no tray icon).
 fn notify(host: HWND, title: &str, text: &str) {
     log(&format!("{title}: {text}"));
-    let mut nid = nid(host);
-    nid.uFlags = NIF_INFO;
-    copy_w(&mut nid.szInfoTitle, title);
-    copy_w(&mut nid.szInfo, text);
-    nid.dwInfoFlags = NIIF_NONE;
-    unsafe {
-        let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
-    }
-}
-
-fn copy_w<const N: usize>(dst: &mut [u16; N], s: &str) {
-    for (i, c) in s.encode_utf16().take(N - 1).enumerate() {
-        dst[i] = c;
-    }
-}
-
-fn nid(host: HWND) -> NOTIFYICONDATAW {
-    NOTIFYICONDATAW { cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32, hWnd: host, uID: 1, ..Default::default() }
-}
-
-fn tray_add(host: HWND) {
-    let mut n = nid(host);
-    n.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-    n.uCallbackMessage = win::WM_TRAY;
-    n.hIcon = unsafe { LoadIconW(Some(win::hinstance()), PCWSTR(1 as _)).or_else(|_| LoadIconW(None, IDI_APPLICATION)).unwrap_or_default() };
-    copy_w(&mut n.szTip, if config::test_mode() { "Framegrab (TEST COPY)" } else { "Framegrab — Print Screen to capture" });
-    unsafe {
-        let _ = Shell_NotifyIconW(NIM_ADD, &n);
-    }
-}
-
-fn tray_remove(host: HWND) {
-    let n = nid(host);
-    unsafe {
-        let _ = Shell_NotifyIconW(NIM_DELETE, &n);
-    }
-}
-
-fn tray_menu(host: HWND) {
-    unsafe {
-        let m = CreatePopupMenu().unwrap_or_default();
-        let add = |id: usize, s: &str| {
-            let w = win::wide(s);
-            let _ = AppendMenuW(m, MF_STRING, id, PCWSTR(w.as_ptr()));
-        };
-        let busy_rec = with(|a| matches!(a.busy, Busy::Recording(..))).unwrap_or(false);
-        if busy_rec {
-            add(100, "Stop recording\tPrtSc");
-            let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
-        }
-        add(1, "Snip\tPrtSc");
-        add(2, "Full screen\tShift+PrtSc");
-        add(4, "Active window\tAlt+PrtSc");
-        add(5, "Grab text\tCtrl+PrtSc");
-        add(6, "Scrolling capture\tCtrl+Alt+PrtSc");
-        add(7, "Record screen\tCtrl+Shift+PrtSc");
-        let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
-        add(20, "Open screenshots folder");
-        add(21, "Open recordings folder");
-        add(22, "Edit an image…");
-        add(23, "Settings");
-        let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
-        add(99, "Quit Framegrab");
-        let mut p = POINT::default();
-        let _ = GetCursorPos(&mut p);
-        let _ = SetForegroundWindow(host);
-        let id = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN, p.x, p.y, None, host, None);
-        let _ = DestroyMenu(m);
-        match id.0 as usize {
-            0 => {}
-            100 => command(Cmd::Record),
-            v @ 1..=7 => {
-                if let Some(c) = Cmd::from(v as u32) {
-                    // Let the menu disappear before freezing the screen.
-                    std::thread::sleep(std::time::Duration::from_millis(150));
-                    command(c);
-                }
-            }
-            20 => open_folder(with(|a| a.cfg.shots_dir())),
-            21 => open_folder(with(|a| a.cfg.recordings_dir())),
-            22 => {
-                if let Some(p) = rfd::FileDialog::new().add_filter("Images", &["png"]).pick_file() {
-                    spawn_self(&["--edit", &p.to_string_lossy()]);
-                }
-            }
-            23 => spawn_self(&["--settings"]),
-            99 => quit(),
-            _ => {}
-        }
-    }
+    toast::show(host, toast::Content::Text { text: text.to_string(), status: title.to_string() }, None, 6);
 }
 
 fn open_folder(p: Option<PathBuf>) {
@@ -278,7 +260,7 @@ fn quit() {
     unsafe { PostQuitMessage(0) };
 }
 
-/// Entry point for hotkeys, tray items and test triggers.
+/// Entry point for hotkeys, the capture menu and test triggers.
 pub fn command(cmd: Cmd) {
     let Some((busy_kind, cfg)) = with(|a| {
         let k = match &a.busy {
@@ -323,24 +305,32 @@ pub fn command(cmd: Cmd) {
         Cmd::Text => start_overlay(Mode::Text, &cfg),
         Cmd::Scroll => start_overlay(Mode::Scroll, &cfg),
         Cmd::Record => start_overlay(Mode::Record, &cfg),
+        Cmd::Menu => {
+            let host = with(|a| a.host).unwrap_or_default();
+            capture_menu(host);
+        }
         Cmd::Screen => {
             let shot = Shot::take(cfg.capture_cursor);
             let (cx, cy) = capture::cursor_pos();
             if let Some(i) = shot.monitor_at(cx, cy).or(Some(0)).filter(|&i| i < shot.imgs.len()) {
-                deliver(shot.imgs[i].clone());
+                let fg = unsafe { GetForegroundWindow() };
+                let meta = Meta { mode: "Screen", app_window: (!fg.0.is_null()).then_some(fg.0 as isize), rect: Some(shot.mons[i].rect), ..Default::default() };
+                deliver(shot.imgs[i].clone(), meta);
             }
         }
         Cmd::AllScreens => {
             let shot = Shot::take(cfg.capture_cursor);
             let r = capture::virtual_rect(&shot.mons);
-            deliver(shot.crop(r));
+            deliver(shot.crop(r), Meta { mode: "Screens", rect: Some(r), ..Default::default() });
         }
         Cmd::Window => {
+            let fg = unsafe { GetForegroundWindow() };
             let shot = Shot::take(cfg.capture_cursor);
             if let Some(r) = capture::foreground_rect() {
                 let vr = capture::virtual_rect(&shot.mons);
                 if let Some(r) = r.intersect(&vr) {
-                    deliver(shot.crop(r));
+                    let h = (!fg.0.is_null()).then_some(fg.0 as isize);
+                    deliver(shot.crop(r), Meta { mode: "Window", window: h, app_window: h, rect: Some(r) });
                 }
             }
         }
@@ -365,9 +355,21 @@ fn overlay_done() {
         return;
     };
     with(|a| a.busy = Busy::Idle);
-    let Some(rect) = done.rect else { return };
+    let Some(rect) = done.rect else {
+        log("overlay closed without a selection");
+        return;
+    };
+    log(&format!("selected {:?} {rect:?} window={}", done.mode, done.window.is_some()));
     match done.mode {
-        Mode::Region | Mode::Screen => deliver(done.shot.crop(rect)),
+        Mode::Region | Mode::Screen => {
+            let meta = Meta {
+                mode: if done.window.is_some() { "Window" } else if done.mode == Mode::Screen { "Screen" } else { "Snip" },
+                window: done.window,
+                app_window: done.under,
+                rect: Some(rect),
+            };
+            deliver(done.shot.crop(rect), meta)
+        }
         Mode::Text => {
             let img = done.shot.crop(rect);
             run_ocr(img);
@@ -377,12 +379,6 @@ fn overlay_done() {
     }
 }
 
-fn job(j: Job) {
-    if let Some((tx, host)) = with(|a| (a.jobs_tx.clone(), a.host)) {
-        let _ = tx.send(j);
-        win::post(host, win::WM_JOB, 0, 0);
-    }
-}
 
 /// A job sender + host handle that can move to worker threads.
 #[derive(Clone)]
@@ -398,69 +394,150 @@ fn jobs_tx() -> Option<JobTx> {
     with(|a| JobTx(a.jobs_tx.clone(), a.host.0 as isize))
 }
 
-/// Clipboard + save + toolbar for a finished image.
-fn deliver(img: Image) {
+/// The capture pipeline. Everything optional (window re-capture, transparent corners, beautify,
+/// format, upload) comes from Settings and runs on a worker thread, so nothing waits on the user.
+fn deliver(img: Image, meta: Meta) {
     schedule_trim();
     let Some((cfg, host)) = with(|a| (a.cfg.clone(), a.host)) else { return };
-    if cfg.copy_to_clipboard {
+    if cfg.sound {
+        crate::feedback::sound();
+    }
+    if cfg.flash {
+        if let Some(r) = meta.rect {
+            crate::feedback::flash(r);
+        }
+    }
+    // Nothing to process: copy right away on this thread (fastest path).
+    let window_work = meta.window.is_some() && (cfg.window_full_content || cfg.window_transparent);
+    let copied_now = cfg.copy_to_clipboard && !window_work && !cfg.beautify;
+    if copied_now {
         output::copy_image(&img);
     }
-    let path = cfg.save_to_disk.then(|| config::unique_path(&cfg.shots_dir(), "Screenshot", "png"));
-    let status = match (cfg.copy_to_clipboard, cfg.save_to_disk) {
-        (true, true) => "Copied and saved",
-        (true, false) => "Copied to clipboard",
-        (false, true) => "Saved to Screenshots",
-        (false, false) => "Captured",
-    };
-    with(|a| a.last = Some((img.clone(), path.clone())));
-    if let Some(p) = path.clone() {
-        let save = img.clone();
-        let tx = jobs_tx();
-        let open = cfg.open_editor;
-        std::thread::spawn(move || {
-            if output::write_png(&p, &save, false).is_ok() {
-                if let Some(tx) = tx {
-                    tx.send(Job::Saved(p.clone()));
-                }
-                if open {
-                    spawn_self(&["--edit", &p.to_string_lossy()]);
+    let (app, title) = meta.app_window.map(|h| (crate::winfo::app_name(h), crate::winfo::title(h))).unwrap_or_default();
+    let tx = jobs_tx();
+    std::thread::spawn(move || {
+        let mut raw = img;
+        if let Some(h) = meta.window {
+            if cfg.window_full_content {
+                if let Some(r) = meta.rect {
+                    let t = std::time::Instant::now();
+                    let got = crate::winfo::print_window(h, r);
+                    log(&format!("  window content {} in {} ms", if got.is_some() { "captured" } else { "unavailable, kept screen pixels" }, t.elapsed().as_millis()));
+                    if let Some(w) = got {
+                        raw = w;
+                    }
                 }
             }
-        });
-    } else if cfg.open_editor {
-        edit_last();
-        return;
-    }
-    if cfg.show_toolbar && !cfg.open_editor {
-        let thumb = img.fit(700, 400);
-        toast::show(host, Content::Image { thumb, size: (img.w, img.h), status: status.into() }, path, cfg.toolbar_seconds);
-    }
+            if cfg.window_transparent && !crate::winfo::is_maximized(h) {
+                let dpi = unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(HWND(h as _)) }.max(96);
+                crate::winfo::round_corners(&mut raw, 8.0 * dpi as f32 / 96.0);
+            }
+        }
+        let fin = if cfg.beautify { crate::process::beautify(&raw, &crate::process::Beautify::from(&cfg)) } else { raw.clone() };
+        if cfg.copy_to_clipboard && !copied_now {
+            output::copy_image(&fin);
+        }
+        let ext = cfg.format.ext();
+        let info = config::NameInfo { app, title, mode: meta.mode.to_string(), w: fin.w, h: fin.h };
+        let path = cfg.save_to_disk.then(|| config::template_path(&cfg.shots_dir(), &cfg.name_template, &info, cfg.app_subfolders, ext));
+        let status = match (cfg.copy_to_clipboard, cfg.save_to_disk) {
+            (true, true) => "Copied and saved",
+            (true, false) => "Copied to clipboard",
+            (false, true) => "Saved",
+            (false, false) => "Captured",
+        };
+        if let Some(tx) = &tx {
+            tx.send(Job::Ready { raw: raw.clone(), thumb: fin.fit(700, 400), size: (fin.w, fin.h), path: path.clone(), status: status.into() });
+        }
+        let mut bytes = None;
+        if let Some(p) = &path {
+            match output::write_image(p, &fin, cfg.format, cfg.quality) {
+                Ok(b) => {
+                    bytes = Some(b);
+                    if let Some(tx) = &tx {
+                        tx.send(Job::Saved(p.clone()));
+                    }
+                    if cfg.open_editor {
+                        let ps = p.to_string_lossy().to_string();
+                        if ext == "png" && !cfg.beautify {
+                            spawn_self(&["--edit", &ps]);
+                        } else if let Some(t) = temp_png(&raw) {
+                            spawn_self(&["--edit", &t.to_string_lossy(), "--out", &ps]);
+                        }
+                    }
+                }
+                Err(e) => log(&format!("save failed: {e}")),
+            }
+        }
+        if cfg.upload.provider != config::UploadProvider::Off && cfg.upload.auto {
+            let b = bytes.or_else(|| output::encode(&fin, cfg.format, cfg.quality).ok());
+            if let (Some(b), Some(tx)) = (b, &tx) {
+                let name = path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| format!("screenshot.{ext}"));
+                tx.send(Job::Uploaded(crate::upload::upload(&cfg.upload, &b, &name, ext)));
+            }
+        }
+    });
+    let _ = host;
+}
+
+fn temp_png(img: &Image) -> Option<PathBuf> {
+    let p = std::env::temp_dir().join(format!("Framegrab edit {}.png", config::stamp()));
+    output::write_png(&p, img, true).ok().map(|_| p)
 }
 
 fn run_ocr(img: Image) {
-    let lang = with(|a| a.cfg.ocr_language.clone()).unwrap_or_default();
+    let cfg = with(|a| a.cfg.clone()).unwrap_or_default();
     let tx = jobs_tx();
     std::thread::spawn(move || {
-        let r = crate::ocr::recognize(&img, &lang);
+        let r = crate::ocr::grab_text(&img, &cfg);
         if let Some(tx) = tx {
             tx.send(Job::Ocr(r));
         }
     });
 }
 
+/// Opens the editor on the last capture. Non-PNG / beautified files are edited from a clean
+/// PNG copy and written back to the real file in its format.
 fn edit_last() {
     let Some((img, path)) = with(|a| a.last.clone()).flatten() else { return };
-    let p = match path.filter(|p| p.exists()) {
-        Some(p) => p,
-        None => {
-            let p = std::env::temp_dir().join(format!("Framegrab {}.png", config::stamp()));
-            if output::write_png(&p, &img, true).is_err() {
-                return;
-            }
-            p
-        }
+    let cfg = with(|a| a.cfg.clone()).unwrap_or_default();
+    let plain_png = path.as_ref().is_some_and(|p| p.exists() && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("png"))) && !cfg.beautify;
+    if plain_png {
+        spawn_self(&["--edit", &path.unwrap().to_string_lossy()]);
+        return;
+    }
+    let Some(t) = temp_png(&img) else { return };
+    match path {
+        Some(p) => spawn_self(&["--edit", &t.to_string_lossy(), "--out", &p.to_string_lossy()]),
+        None => spawn_self(&["--edit", &t.to_string_lossy()]),
+    }
+}
+
+/// File for the last capture (saved one, else a temp PNG) — for drag-out.
+pub fn last_file() -> Option<PathBuf> {
+    if let Some(p) = toast::path().filter(|p| p.exists()) {
+        return Some(p);
+    }
+    let (img, _) = with(|a| a.last.clone()).flatten()?;
+    temp_png(&img)
+}
+
+fn upload_last() {
+    let Some(p) = toast::path().filter(|p| p.exists()) else {
+        toast::set_status("Save is off — nothing to upload");
+        return;
     };
-    spawn_self(&["--edit", &p.to_string_lossy()]);
+    let cfg = with(|a| a.cfg.clone()).unwrap_or_default();
+    let tx = jobs_tx();
+    toast::set_status("Uploading…");
+    std::thread::spawn(move || {
+        let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_else(|| "png".into());
+        let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let r = std::fs::read(&p).map_err(|e| e.to_string()).and_then(|b| crate::upload::upload(&cfg.upload, &b, &name, &ext));
+        if let Some(tx) = tx {
+            tx.send(Job::Uploaded(r));
+        }
+    });
 }
 
 fn toast_action(a: Action) {
@@ -476,10 +553,22 @@ fn toast_action(a: Action) {
             }
         }
         Action::Copy => {
-            if let Some((img, _)) = with(|a| a.last.clone()).flatten() {
-                output::copy_image(&img);
-            } else if let Some(t) = LAST_TEXT.with(|t| t.borrow().clone()) {
+            if let Some(t) = LAST_TEXT.with(|t| t.borrow().clone()).filter(|_| with(|a| a.last.is_none()).unwrap_or(true)) {
                 output::copy_text(&t);
+            } else if let Some(p) = toast::path().filter(|p| p.exists()) {
+                // Copy what was saved (includes beautify/transparency).
+                match output::read_png(&p) {
+                    Ok(img) => {
+                        output::copy_image(&img);
+                    }
+                    Err(_) => {
+                        if let Some((img, _)) = with(|a| a.last.clone()).flatten() {
+                            output::copy_image(&img);
+                        }
+                    }
+                }
+            } else if let Some((img, _)) = with(|a| a.last.clone()).flatten() {
+                output::copy_image(&img);
             }
             toast::dismiss();
         }
@@ -498,10 +587,10 @@ fn toast_action(a: Action) {
             with(|a| a.last = None);
             toast::dismiss();
         }
+        Action::Upload => upload_last(),
         Action::Close => toast::dismiss(),
     }
 }
-
 thread_local! {
     static LAST_TEXT: RefCell<Option<String>> = const { RefCell::new(None) };
 }
@@ -609,7 +698,7 @@ fn scroll_finish() {
     })
     .flatten();
     if let Some(st) = st {
-        deliver(st.finish());
+        deliver(st.finish(), Meta { mode: "Scroll", ..Default::default() });
     }
 }
 
@@ -773,10 +862,30 @@ fn handle_jobs() {
         let Some(j) = with(|a| a.jobs_rx.try_recv().ok()).flatten() else { break };
         let Some((host, cfg)) = with(|a| (a.host, a.cfg.clone())) else { return };
         match j {
+            Job::Ready { raw, thumb, size, path, status } => {
+                with(|a| a.last = Some((raw, path.clone())));
+                if cfg.show_toolbar && !cfg.open_editor {
+                    let upload = cfg.upload.provider != config::UploadProvider::Off && !cfg.upload.auto;
+                    toast::show(host, Content::Image { thumb, size, status, upload }, path, cfg.toolbar_seconds);
+                }
+            }
             Job::Saved(_) => {}
+            Job::Uploaded(Ok(url)) => {
+                if cfg.upload.copy_link {
+                    output::copy_text(&url);
+                    toast::set_status("Uploaded — link copied");
+                } else {
+                    toast::set_status("Uploaded");
+                }
+                log(&format!("uploaded: {url}"));
+            }
+            Job::Uploaded(Err(e)) => {
+                toast::set_status("Upload failed");
+                notify(host, "Upload failed", &e);
+            }
             Job::Msg(m) => notify(host, "Framegrab", &m),
-            Job::Ocr(Ok(text)) => {
-                let t = text.trim().to_string();
+            Job::Ocr(Ok(out)) => {
+                let t = out.text.trim().to_string();
                 if t.is_empty() {
                     toast::show(host, Content::Text { text: "No text found in that area.".into(), status: "Nothing to copy".into() }, None, cfg.toolbar_seconds.max(3));
                 } else {
@@ -784,7 +893,12 @@ fn handle_jobs() {
                     LAST_TEXT.with(|l| *l.borrow_mut() = Some(t.clone()));
                     with(|a| a.last = None);
                     let n = t.chars().count();
-                    toast::show(host, Content::Text { text: t, status: format!("Copied {n} characters") }, None, cfg.toolbar_seconds);
+                    let status = match out.kind {
+                        crate::ocr::Kind::Qr => "QR code copied".to_string(),
+                        crate::ocr::Kind::Table => format!("Table copied ({} rows)", t.lines().count()),
+                        crate::ocr::Kind::Text => format!("Copied {n} characters"),
+                    };
+                    toast::show(host, Content::Text { text: t, status }, None, cfg.toolbar_seconds);
                 }
             }
             Job::Ocr(Err(e)) => toast::show(host, Content::Text { text: e, status: "Couldn't read text".into() }, None, cfg.toolbar_seconds.max(4)),
@@ -820,6 +934,10 @@ fn copydata(s: &str) {
             with(|a| a.cfg = cfg);
         }
         "quit" => quit(),
+        "pause" => {
+            hook::PAUSED.store(rest != "off", Relaxed);
+            write_status();
+        }
         "sim" => overlay::sim(rest),
         "key" => {
             if let Ok(vk) = rest.parse::<u32>() {
@@ -854,9 +972,9 @@ fn copydata(s: &str) {
             let _ = std::fs::write(dir.join("dxgi.txt"), rep);
         }
         "deliver-test" => {
-            // Shows the toolbar for an existing PNG.
+            // Runs the pipeline on an existing PNG.
             if let Ok(img) = output::read_png(std::path::Path::new(rest)) {
-                deliver(img);
+                deliver(img, Meta { mode: "Snip", ..Default::default() });
             }
         }
         "ocr-file" => {
@@ -920,11 +1038,6 @@ fn route_key(vk: u32) {
 
 unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
-        let tbc = with(|a| a.taskbar_created).unwrap_or(0);
-        if msg == tbc && tbc != 0 {
-            tray_add(h);
-            return LRESULT(0);
-        }
         match msg {
             win::WM_CMD => {
                 if let Some(c) = Cmd::from(wp.0 as u32) {
@@ -959,15 +1072,8 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                     TIMER_SCROLL => scroll_tick(),
                     TIMER_REC => rec_tick(),
                     TIMER_TRIM => trim_tick(h),
+                    TIMER_GAME => game_tick(),
                     crate::updater::TIMER_ID => crate::updater::on_timer(h),
-                    _ => {}
-                }
-                LRESULT(0)
-            }
-            win::WM_TRAY => {
-                match (lp.0 as u32) & 0xFFFF {
-                    WM_LBUTTONUP => command(Cmd::Region),
-                    WM_RBUTTONUP | WM_CONTEXTMENU => tray_menu(h),
                     _ => {}
                 }
                 LRESULT(0)

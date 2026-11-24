@@ -49,6 +49,7 @@ pub mod icon {
     pub const FILM: &str = "\u{E792}";
     pub const GIF: &str = "\u{EA82}";
     pub const APP_WINDOW: &str = "\u{E5DA}";
+    pub const UPLOAD: &str = "\u{E4C0}";
 }
 
 pub struct Factories {
@@ -362,14 +363,7 @@ mod icon_sheet {
         unsafe {
             let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
         }
-        let cands: Vec<(&str, u32)> = vec![
-            ("cursor", 0xE1DC), ("arrowUR", 0xE092), ("square", 0xE45E), ("circle", 0xE18A), ("lineseg", 0xE6E6),
-            ("highlt", 0xEC86), ("textT", 0xE48A), ("num1", 0xE3F6), ("drop", 0xE210), ("crop", 0xE1D4),
-            ("undo", 0xE038), ("redo", 0xE036), ("floppy", 0xE248), ("scroll", 0xEB7A), ("record", 0xE3EE),
-            ("mic", 0xE326), ("micX", 0xE328), ("spkr", 0xE44A), ("spkrX", 0xE45C), ("eyeX", 0xE224),
-            ("cursorClk", 0xE7D8), ("handGrab", 0xE80C), ("listNum", 0xE2F6), ("dropHalf", 0xE566), ("gridFour", 0xE296),
-            ("arrowR", 0xE06C), ("export", 0xEAF0), ("magPlus", 0xE310), ("magMinus", 0xE30E), ("sliders", 0xE434),
-            ("penNib", 0xE3AC), ("eraser", 0xE8B2), ("paintBr", 0xE6F0), ("selection", 0xE69A), ("checkCirc", 0xE184),
+        let cands: Vec<(&str, u32)> = vec![("c", 0xE03E), ("c", 0xE040), ("c", 0xE042), ("c", 0xE046), ("c", 0xE048), ("c", 0xE04C), ("c", 0xE69A), ("c", 0xE69C), ("c", 0xE69E), ("c", 0xE6A0), ("c", 0xE2C2), ("c", 0xE2C0), ("c", 0xE72A), ("c", 0xE0F6), ("c", 0xE5C0), ("c", 0xE4C2), ("c", 0xE1F4), ("c", 0xE1F6), ("c", 0xE1F8), ("c", 0xE3A6)
         ];
         let cols = 5;
         let (cw, ch) = (180.0f32, 70.0f32);

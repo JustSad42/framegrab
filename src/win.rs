@@ -8,7 +8,6 @@ use windows_core::PCWSTR;
 
 pub const WM_CMD: u32 = WM_APP + 1;
 pub const WM_OVERLAY_DONE: u32 = WM_APP + 2;
-pub const WM_TRAY: u32 = WM_APP + 3;
 pub const WM_JOB: u32 = WM_APP + 4;
 pub const WM_KEYROUTE: u32 = WM_APP + 5;
 pub const WM_TOAST: u32 = WM_APP + 6;

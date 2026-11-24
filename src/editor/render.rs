@@ -127,13 +127,15 @@ pub fn flatten(base: &Image, shapes: &[Shape], crop: Option<egui::Rect>, font_by
         let r = egui::Rect::from_two_pos(s.a, s.b);
         pixelate(&mut img, r.min.x as i32, r.min.y as i32, r.max.x as i32, r.max.y as i32);
     }
+    spotlight(&mut img, shapes);
     let rgba = img.to_rgba();
     let Some(mut pm) = Pixmap::from_vec(rgba, tiny_skia::IntSize::from_wh(img.w, img.h).unwrap()) else { return img };
     let font = font_bytes.and_then(|b| FontRef::try_from_slice(b).ok());
     for s in shapes {
         let p = paint(if s.kind == Kind::Marker { super::marker_color(s.color) } else { s.color });
         match s.kind {
-            Kind::Blur => {}
+            Kind::Blur | Kind::Spotlight => {}
+            Kind::Curve | Kind::Callout => draw_extra(&mut pm, s, &p, font.as_ref()),
             Kind::Rect => {
                 let r = egui::Rect::from_two_pos(s.a, s.b);
                 if let Some(rr) = tiny_skia::Rect::from_ltrb(r.min.x, r.min.y, r.max.x, r.max.y) {
@@ -218,4 +220,167 @@ pub fn flatten(base: &Image, shapes: &[Shape], crop: Option<egui::Rect>, font_by
         }
         None => out,
     }
+}
+
+/// Spotlight dimming (alpha of the black overlay outside the boxes).
+pub const SPOT_DIM: u8 = 150;
+
+/// Grid cells of `full` that lie outside every rect in `spots` (their union is left bright).
+pub fn outside_cells(full: egui::Rect, spots: &[egui::Rect]) -> Vec<egui::Rect> {
+    let mut xs = vec![full.min.x, full.max.x];
+    let mut ys = vec![full.min.y, full.max.y];
+    for r in spots {
+        xs.extend([r.min.x.clamp(full.min.x, full.max.x), r.max.x.clamp(full.min.x, full.max.x)]);
+        ys.extend([r.min.y.clamp(full.min.y, full.max.y), r.max.y.clamp(full.min.y, full.max.y)]);
+    }
+    for v in [&mut xs, &mut ys] {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        v.dedup_by(|a, b| (*a - *b).abs() < 0.01);
+    }
+    let mut out = Vec::new();
+    for yw in ys.windows(2) {
+        for xw in xs.windows(2) {
+            let cell = egui::Rect::from_min_max(egui::pos2(xw[0], yw[0]), egui::pos2(xw[1], yw[1]));
+            if !spots.iter().any(|s| s.contains(cell.center())) {
+                out.push(cell);
+            }
+        }
+    }
+    out
+}
+
+/// Bend point for a curved arrow: a third of its length to the left of travel.
+pub fn curve_ctrl(a: egui::Pos2, b: egui::Pos2) -> egui::Pos2 {
+    let d = b - a;
+    let n = egui::vec2(d.y, -d.x);
+    a + d * 0.5 + n * 0.3
+}
+
+pub fn curve_pts_to(a: egui::Pos2, c: egui::Pos2, e: egui::Pos2, n: usize) -> Vec<egui::Pos2> {
+    (0..=n)
+        .map(|i| {
+            let t = i as f32 / n as f32;
+            let u = 1.0 - t;
+            egui::pos2(u * u * a.x + 2.0 * u * t * c.x + t * t * e.x, u * u * a.y + 2.0 * u * t * c.y + t * t * e.y)
+        })
+        .collect()
+}
+
+pub fn curve_pts(a: egui::Pos2, b: egui::Pos2, n: usize) -> Vec<egui::Pos2> {
+    curve_pts_to(a, curve_ctrl(a, b), b, n)
+}
+
+pub fn callout_px(w: f32) -> f32 {
+    (super::text_px(w) * 0.8).max(17.0)
+}
+pub fn callout_pad(px: f32) -> f32 {
+    px * 0.55
+}
+pub fn callout_radius(px: f32) -> f32 {
+    px * 0.6
+}
+
+/// Bubble rect (centred on `s.b`) and tail triangle (tip at `s.a`). `text` is the text block size.
+pub fn callout_geom(s: &Shape, text: (f32, f32)) -> (egui::Rect, [egui::Pos2; 3]) {
+    let px = callout_px(s.width);
+    let pad = callout_pad(px);
+    let size = egui::vec2((text.0 + pad * 2.0).max(px * 3.0), text.1 + pad * 2.0);
+    let r = egui::Rect::from_center_size(s.b, size);
+    let d = s.a - r.center();
+    let len = d.length().max(0.001);
+    let n = egui::vec2(-d.y, d.x) / len;
+    let hw = size.x.min(size.y) * 0.24;
+    (r, [s.a, r.center() + n * hw, r.center() - n * hw])
+}
+
+fn fill_poly(pm: &mut Pixmap, pts: &[egui::Pos2], p: &Paint) {
+    let mut pb = PathBuilder::new();
+    pb.move_to(pts[0].x, pts[0].y);
+    for q in &pts[1..] {
+        pb.line_to(q.x, q.y);
+    }
+    pb.close();
+    if let Some(path) = pb.finish() {
+        pm.fill_path(&path, p, FillRule::Winding, Transform::identity(), None);
+    }
+}
+
+/// Darkens everything outside the spotlight boxes.
+fn spotlight(img: &mut Image, shapes: &[Shape]) {
+    let spots: Vec<egui::Rect> = shapes.iter().filter(|s| s.kind == Kind::Spotlight).map(|s| egui::Rect::from_two_pos(s.a, s.b)).collect();
+    if spots.is_empty() {
+        return;
+    }
+    let keep = 255 - SPOT_DIM as u32;
+    let full = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(img.w as f32, img.h as f32));
+    for c in outside_cells(full, &spots) {
+        let (x0, x1) = (c.min.x.round() as u32, (c.max.x.round() as u32).min(img.w));
+        let (y0, y1) = (c.min.y.round() as u32, (c.max.y.round() as u32).min(img.h));
+        for y in y0..y1 {
+            let row = &mut img.px[((y * img.w + x0) * 4) as usize..((y * img.w + x1) * 4) as usize];
+            for p in row.chunks_exact_mut(4) {
+                for v in &mut p[..3] {
+                    *v = ((*v as u32 * keep) / 255) as u8;
+                }
+            }
+        }
+    }
+}
+
+fn draw_extra(pm: &mut Pixmap, s: &Shape, p: &Paint, font: Option<&FontRef>) {
+    match s.kind {
+        Kind::Curve => {
+            let c = curve_ctrl(s.a, s.b);
+            let (end, tri) = arrow_geom(c, s.b, s.width);
+            let mut pb = PathBuilder::new();
+            pb.move_to(s.a.x, s.a.y);
+            pb.quad_to(c.x, c.y, end.x, end.y);
+            if let Some(path) = pb.finish() {
+                pm.stroke_path(&path, p, &stroke(s.width), Transform::identity(), None);
+            }
+            fill_poly(pm, &tri, p);
+            let mut pb = PathBuilder::new();
+            pb.move_to(tri[0].x, tri[0].y);
+            pb.line_to(tri[1].x, tri[1].y);
+            pb.line_to(tri[2].x, tri[2].y);
+            pb.close();
+            if let Some(path) = pb.finish() {
+                pm.stroke_path(&path, p, &stroke(s.width * 0.5), Transform::identity(), None);
+            }
+        }
+        Kind::Callout => {
+            let px = callout_px(s.width);
+            let dims = font.map(|f| text_size(f, if s.text.is_empty() { " " } else { &s.text }, px)).unwrap_or((px * 4.0, px * 1.3));
+            let (r, tri) = callout_geom(s, dims);
+            fill_poly(pm, &tri, p);
+            if let Some(rr) = tiny_skia::Rect::from_ltrb(r.min.x, r.min.y, r.max.x, r.max.y) {
+                if let Some(path) = round_rect(rr, callout_radius(px)) {
+                    pm.fill_path(&path, p, FillRule::Winding, Transform::identity(), None);
+                }
+            }
+            if let Some(f) = font {
+                let pad = callout_pad(px);
+                draw_text(pm, f, &s.text, r.min.x + pad, r.min.y + pad, px, super::contrast(s.color), false);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn round_rect(r: tiny_skia::Rect, rad: f32) -> Option<tiny_skia::Path> {
+    let rad = rad.min(r.width() / 2.0).min(r.height() / 2.0);
+    let (l, t, rt, b) = (r.left(), r.top(), r.right(), r.bottom());
+    let k = rad * 0.4477;
+    let mut pb = PathBuilder::new();
+    pb.move_to(l + rad, t);
+    pb.line_to(rt - rad, t);
+    pb.cubic_to(rt - k, t, rt, t + k, rt, t + rad);
+    pb.line_to(rt, b - rad);
+    pb.cubic_to(rt, b - k, rt - k, b, rt - rad, b);
+    pb.line_to(l + rad, b);
+    pb.cubic_to(l + k, b, l, b - k, l, b - rad);
+    pb.line_to(l, t + rad);
+    pb.cubic_to(l, t + k, l + k, t, l + rad, t);
+    pb.close();
+    pb.finish()
 }

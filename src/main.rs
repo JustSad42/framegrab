@@ -7,18 +7,23 @@ mod bar;
 mod capture;
 mod config;
 mod dxgi;
+mod dragout;
 mod editor;
+mod feedback;
 mod gfx;
 mod hook;
 mod ocr;
 mod output;
 mod overlay;
+mod process;
+mod upload;
 mod record;
 mod scroll;
 mod settings;
 mod toast;
 mod ui;
 mod updater;
+mod winfo;
 mod win;
 
 use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
@@ -31,7 +36,7 @@ fn main() {
     let after = |f: &str| args.iter().position(|a| a == f).and_then(|i| args.get(i + 1)).cloned();
 
     if let Some(p) = after("--edit") {
-        editor::run(std::path::PathBuf::from(p));
+        editor::run(std::path::PathBuf::from(p), after("--out").map(std::path::PathBuf::from));
         return;
     }
     if has("--settings") {

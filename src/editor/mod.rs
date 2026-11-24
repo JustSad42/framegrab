@@ -20,6 +20,9 @@ pub enum Kind {
     Text,
     Step,
     Blur,
+    Spotlight,
+    Callout,
+    Curve,
 }
 
 #[derive(Clone, Debug)]
@@ -40,20 +43,25 @@ enum Tool {
     Select,
     Draw(Kind),
     Crop,
+    Pick,
 }
 
-const TOOLS: [(Tool, &str, &str, egui::Key); 11] = [
+const TOOLS: [(Tool, &str, &str, egui::Key); 15] = [
     (Tool::Select, "\u{E1DC}", "Select & move  (V)", egui::Key::V),
     (Tool::Draw(Kind::Arrow), "\u{E092}", "Arrow  (A)", egui::Key::A),
+    (Tool::Draw(Kind::Curve), "curve", "Curved arrow  (U)", egui::Key::U),
     (Tool::Draw(Kind::Rect), "\u{E45E}", "Rectangle  (R)", egui::Key::R),
     (Tool::Draw(Kind::Ellipse), "\u{E18A}", "Ellipse  (E)", egui::Key::E),
     (Tool::Draw(Kind::Line), "\u{E32A}", "Line  (L)", egui::Key::L),
     (Tool::Draw(Kind::Pen), "\u{E3B4}", "Pen  (P)", egui::Key::P),
     (Tool::Draw(Kind::Marker), "\u{E6F0}", "Highlighter  (H)", egui::Key::H),
     (Tool::Draw(Kind::Text), "\u{E48A}", "Text  (T)", egui::Key::T),
+    (Tool::Draw(Kind::Callout), "\u{E160}", "Callout bubble  (K) - drag from the point to where the bubble goes", egui::Key::K),
     (Tool::Draw(Kind::Step), "\u{E2F6}", "Numbered step  (N)", egui::Key::N),
+    (Tool::Draw(Kind::Spotlight), "spot", "Spotlight  (S) - dims everything outside the boxes", egui::Key::S),
     (Tool::Draw(Kind::Blur), "\u{E296}", "Pixelate  (B)", egui::Key::B),
     (Tool::Crop, "\u{E1D4}", "Crop  (C)", egui::Key::C),
+    (Tool::Pick, "\u{EAC4}", "Pick a colour from the image  (I)", egui::Key::I),
 ];
 
 const COLORS: [Color32; 8] = [
@@ -105,6 +113,11 @@ static DEMO_SHOT: std::sync::LazyLock<std::sync::Arc<std::sync::Mutex<Option<std
 
 struct Editor {
     path: PathBuf,
+    /// Where Save writes (format from its extension); defaults to `path`.
+    out: PathBuf,
+    cfg: crate::config::Config,
+    beautify: bool,
+    custom: Option<Color32>,
     base: Image,
     tiles: Vec<(Rect, egui::TextureHandle)>,
     shapes: Vec<Shape>,
@@ -135,7 +148,7 @@ struct Editor {
     demo: Option<(PathBuf, u32)>,
 }
 
-pub fn run(path: PathBuf) {
+pub fn run(path: PathBuf, out: Option<PathBuf>) {
     let base = match crate::output::read_png(&path) {
         Ok(i) => i,
         Err(e) => {
@@ -152,13 +165,13 @@ pub fn run(path: PathBuf) {
             let s = m.scale();
             let maxw = m.work.w as f32 / s * 0.9;
             let maxh = m.work.h as f32 / s * 0.9;
-            ((base.w as f32 / s + 48.0).max(1180.0).min(maxw.max(1180.0)), (base.h as f32 / s + 120.0).clamp(560.0, maxh.max(560.0)))
+            ((base.w as f32 / s + 48.0).max(1340.0).min(maxw.max(1340.0)), (base.h as f32 / s + 120.0).clamp(560.0, maxh.max(560.0)))
         }
-        None => (1200.0, 800.0),
+        None => (1340.0, 800.0),
     };
     let title = format!("{} — Framegrab", path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default());
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_title(title).with_inner_size([ww, wh]).with_min_inner_size([1000.0, 480.0]).with_icon(ui::app_icon()),
+        viewport: egui::ViewportBuilder::default().with_title(title).with_inner_size([ww, wh]).with_min_inner_size([1300.0, 480.0]).with_icon(ui::app_icon()),
         centered: true,
         ..Default::default()
     };
@@ -167,14 +180,19 @@ pub fn run(path: PathBuf) {
         options,
         Box::new(move |cc| {
             ui::install(&cc.egui_ctx);
-            Ok(Box::new(Editor::new(path, base)))
+            Ok(Box::new(Editor::new(path, out, base)))
         }),
     );
 }
 
 impl Editor {
-    fn new(path: PathBuf, base: Image) -> Self {
+    fn new(path: PathBuf, out: Option<PathBuf>, base: Image) -> Self {
+        let cfg = crate::config::Config::load();
         Self {
+            out: out.unwrap_or_else(|| path.clone()),
+            beautify: cfg.beautify,
+            cfg,
+            custom: None,
             path,
             base,
             tiles: Vec::new(),
@@ -223,8 +241,12 @@ impl Editor {
         let mut s6 = mk(self, Kind::Marker, pos2(w * 0.5, h * 0.55), pos2(w * 0.85, h * 0.55), COLORS[2]);
         s6.pts = vec![pos2(w * 0.5, h * 0.55), pos2(w * 0.85, h * 0.55)];
         let s7 = mk(self, Kind::Ellipse, pos2(w * 0.6, h * 0.62), pos2(w * 0.8, h * 0.9), COLORS[3]);
-        self.shapes = vec![s1, s2, s3, s4, s5, s6, s7];
-        self.selected = Some(6);
+        let s8 = mk(self, Kind::Curve, pos2(w * 0.15, h * 0.55), pos2(w * 0.4, h * 0.7), COLORS[1]);
+        let mut s9 = mk(self, Kind::Callout, pos2(w * 0.3, h * 0.25), pos2(w * 0.32, h * 0.52), COLORS[4]);
+        s9.text = "Look here".into();
+        let s10 = mk(self, Kind::Spotlight, pos2(w * 0.08, h * 0.06), pos2(w * 0.5, h * 0.95), COLORS[0]);
+        self.shapes = vec![s10, s1, s2, s3, s4, s5, s6, s7, s8, s9];
+        self.selected = Some(7);
     }
 
     fn snapshot(&mut self) {
@@ -273,16 +295,30 @@ impl Editor {
             }
             Kind::Step => Rect::from_center_size(s.a, Vec2::splat(step_radius(s.width) * 2.0)),
             Kind::Text => {
-                let (w, h) = self
-                    .font
-                    .as_ref()
-                    .and_then(|b| ab_glyph::FontRef::try_from_slice(b).ok())
-                    .map(|f| render::text_size(&f, if s.text.is_empty() { " " } else { &s.text }, text_px(s.width)))
-                    .unwrap_or((text_px(s.width) * s.text.len() as f32 * 0.5, text_px(s.width) * 1.3));
+                let (w, h) = self.text_dims(&s.text, text_px(s.width));
                 Rect::from_min_size(s.a, vec2(w.max(8.0), h))
+            }
+            Kind::Callout => {
+                let (bubble, _) = render::callout_geom(s, self.text_dims(&s.text, render::callout_px(s.width)));
+                let mut r = bubble;
+                r.extend_with(s.a);
+                r
+            }
+            Kind::Curve => {
+                let mut r = Rect::from_two_pos(s.a, s.b);
+                r.extend_with(render::curve_ctrl(s.a, s.b));
+                r.expand(s.width * 3.0)
             }
             _ => Rect::from_two_pos(s.a, s.b).expand(s.width),
         }
+    }
+
+    fn text_dims(&self, text: &str, px: f32) -> (f32, f32) {
+        self.font
+            .as_ref()
+            .and_then(|b| ab_glyph::FontRef::try_from_slice(b).ok())
+            .map(|f| render::text_size(&f, if text.is_empty() { " " } else { text }, px))
+            .unwrap_or((px * text.len().max(1) as f32 * 0.5, px * 1.3))
     }
 
     fn hit(&self, p: Pos2, slop: f32) -> Option<usize> {
@@ -294,8 +330,13 @@ impl Editor {
             }
             match s.kind {
                 Kind::Line | Kind::Arrow => dist_seg(p, s.a, s.b) <= s.width + slop,
+                Kind::Curve => render::curve_pts(s.a, s.b, 24).windows(2).any(|w| dist_seg(p, w[0], w[1]) <= s.width + slop),
+                Kind::Callout => {
+                    let (bubble, tri) = render::callout_geom(s, self.text_dims(&s.text, render::callout_px(s.width)));
+                    bubble.contains(p) || dist_seg(p, tri[0], tri[1]) <= slop * 2.0 || dist_seg(p, tri[0], tri[2]) <= slop * 2.0
+                }
                 Kind::Pen | Kind::Marker => s.pts.windows(2).any(|w| dist_seg(p, w[0], w[1]) <= s.width * 2.0 + slop),
-                Kind::Rect | Kind::Ellipse => {
+                Kind::Rect | Kind::Ellipse | Kind::Spotlight => {
                     let r = Rect::from_two_pos(s.a, s.b);
                     let inner = r.shrink(s.width + slop);
                     !inner.contains(p) || r.width() < 3.0 * slop || r.height() < 3.0 * slop
@@ -309,17 +350,28 @@ impl Editor {
         render::flatten(&self.base, &self.shapes, self.crop, self.font.as_deref())
     }
 
+    /// What Save/Copy produce: the flattened image, beautified if that's on.
+    fn export(&self) -> Image {
+        let img = self.flatten();
+        if self.beautify { crate::process::beautify(&img, &crate::process::Beautify::from(&self.cfg)) } else { img }
+    }
+
+    fn write(&self, path: &std::path::Path, img: &Image) -> Result<(), String> {
+        crate::output::write_image(path, img, format_of(path), self.cfg.quality).map(|_| ())
+    }
+
     fn copy(&mut self, now: f64) {
         self.finish_edit();
-        let img = self.flatten();
+        let img = self.export();
         crate::output::copy_image(&img);
         self.status = Some(("Copied to clipboard".into(), now));
     }
 
     fn save(&mut self, now: f64) -> bool {
         self.finish_edit();
-        let img = self.flatten();
-        match crate::output::write_png(&self.path, &img, false) {
+        let img = self.export();
+        let out = self.out.clone();
+        match self.write(&out, &img) {
             Ok(()) => {
                 crate::output::copy_image(&img);
                 self.dirty = false;
@@ -335,14 +387,25 @@ impl Editor {
 
     fn save_as(&mut self, now: f64) {
         self.finish_edit();
-        let dir = self.path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
-        let name = self.path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_else(|| "Screenshot.png".into());
-        if let Some(p) = rfd::FileDialog::new().set_directory(dir).set_file_name(name).add_filter("PNG image", &["png"]).save_file() {
-            let p = if p.extension().is_none() { p.with_extension("png") } else { p };
-            let img = self.flatten();
-            match crate::output::write_png(&p, &img, false) {
+        let dir = self.out.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+        let name = self.out.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_else(|| "Screenshot.png".into());
+        let ext = self.out.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_else(|| "png".into());
+        let mut dlg = rfd::FileDialog::new().set_directory(dir).set_file_name(name);
+        // The current format first so it's the default filter.
+        let mut filters = vec![("PNG image", "png"), ("JPEG image", "jpg"), ("WebP image", "webp"), ("AVIF image", "avif")];
+        if let Some(i) = filters.iter().position(|f| f.1 == ext) {
+            let f = filters.remove(i);
+            filters.insert(0, f);
+        }
+        for (n, e) in &filters {
+            dlg = dlg.add_filter(*n, &[*e]);
+        }
+        if let Some(p) = dlg.save_file() {
+            let p = if p.extension().is_none() { p.with_extension(&ext) } else { p };
+            let img = self.export();
+            match self.write(&p, &img) {
                 Ok(()) => {
-                    self.path = p;
+                    self.out = p;
                     self.dirty = false;
                     self.status = Some(("Saved".into(), now));
                 }
@@ -438,13 +501,19 @@ impl Editor {
                     ui.painter().circle_stroke(center, 7.5, Stroke::new(1.0, Color32::from_gray(90)));
                 }
                 if resp.clicked() {
-                    self.color = c;
-                    if let Some(i) = self.selected.or(self.editing) {
-                        if i < self.shapes.len() && self.shapes[i].color != c {
-                            self.snapshot();
-                            self.shapes[i].color = c;
-                        }
-                    }
+                    self.set_color(c);
+                }
+            }
+            if let Some(c) = self.custom {
+                let (r, resp) = ui.allocate_exact_size(vec2(24.0, 30.0), Sense::click());
+                let center = r.center();
+                if self.color == c {
+                    ui.painter().circle_stroke(center, 10.5, Stroke::new(2.0, TEXT));
+                }
+                ui.painter().circle_filled(center, 7.5, c);
+                ui.painter().circle_stroke(center, 7.5, Stroke::new(1.0, Color32::from_gray(90)));
+                if resp.on_hover_text(format!("Picked colour #{:02X}{:02X}{:02X}", c.r(), c.g(), c.b())).clicked() {
+                    self.set_color(c);
                 }
             }
             separator(ui);
@@ -473,6 +542,12 @@ impl Editor {
             if icon_button(ui, "\u{E036}", false, "Redo  (Ctrl+Y)").clicked() {
                 self.do_redo();
             }
+            separator(ui);
+            let tip = if self.beautify { "Beautify is on: background, padding, rounded corners and shadow are added when saving  (F)\nStyle and default: Settings" } else { "Beautify: add a background, padding, rounded corners and shadow  (F)" };
+            if icon_button(ui, "\u{E6A2}", self.beautify, tip).clicked() {
+                self.beautify = !self.beautify;
+                self.dirty = true;
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 if primary_button(ui, "\u{E182}", "Done").on_hover_text("Save, copy and close  (Enter)").clicked() && self.save(now) {
@@ -487,6 +562,16 @@ impl Editor {
                 }
             });
         });
+    }
+
+    fn set_color(&mut self, c: Color32) {
+        self.color = c;
+        if let Some(i) = self.selected.or(self.editing) {
+            if i < self.shapes.len() && self.shapes[i].color != c {
+                self.snapshot();
+                self.shapes[i].color = c;
+            }
+        }
     }
 
     fn keys(&mut self, ctx: &egui::Context, now: f64) {
@@ -539,6 +624,10 @@ impl Editor {
         if pressed(egui::Key::Num0) {
             self.fitted = false;
         }
+        if !cmd && pressed(egui::Key::F) {
+            self.beautify = !self.beautify;
+            self.dirty = true;
+        }
     }
 
     fn canvas(&mut self, ui: &mut egui::Ui) {
@@ -576,6 +665,24 @@ impl Editor {
         let to_i = |p: Pos2| ((p - origin) / z).to_pos2();
         let img_rect = Rect::from_min_size(origin, vec2(self.base.w as f32, self.base.h as f32) * z);
 
+        // Beautify preview: the gradient frame around the (cropped) image.
+        if self.beautify {
+            let c = self.crop.unwrap_or(Rect::from_min_size(Pos2::ZERO, vec2(self.base.w as f32, self.base.h as f32)));
+            let pad = self.cfg.beautify_padding as f32 * crate::process::Beautify::scale(c.width() as u32, c.height() as u32);
+            let fr = Rect::from_min_max(to_s(c.min - Vec2::splat(pad)), to_s(c.max + Vec2::splat(pad)));
+            let (_, c0, c1) = crate::process::BACKGROUNDS[(self.cfg.beautify_bg as usize).min(crate::process::BACKGROUNDS.len() - 1)];
+            let rgb = |v: u32| Color32::from_rgb((v >> 16) as u8, (v >> 8) as u8, v as u8);
+            let (a, b) = (rgb(c0), rgb(c1));
+            let mid = a.lerp_to_gamma(b, 0.5);
+            let mut mesh = egui::Mesh::default();
+            mesh.colored_vertex(fr.left_top(), a);
+            mesh.colored_vertex(fr.right_top(), mid);
+            mesh.colored_vertex(fr.right_bottom(), b);
+            mesh.colored_vertex(fr.left_bottom(), mid);
+            mesh.add_triangle(0, 1, 2);
+            mesh.add_triangle(0, 2, 3);
+            painter.add(mesh);
+        }
         // Image + soft shadow.
         painter.rect_filled(img_rect.expand(1.0), CornerRadius::ZERO, Color32::from_black_alpha(140));
         for (r, t) in &self.tiles {
@@ -588,10 +695,22 @@ impl Editor {
             self.interact(&resp, &to_i, shift, &ctx);
         }
 
+        // Spotlight: dim everything outside the union of the spotlight boxes.
+        let mut spots: Vec<Rect> = self.shapes.iter().filter(|s| s.kind == Kind::Spotlight).map(|s| Rect::from_two_pos(s.a, s.b)).collect();
+        if let Some(d) = self.drawing.as_ref().filter(|d| d.kind == Kind::Spotlight) {
+            spots.push(Rect::from_two_pos(d.a, d.b));
+        }
+        if !spots.is_empty() {
+            let full = Rect::from_min_size(Pos2::ZERO, vec2(self.base.w as f32, self.base.h as f32));
+            for r in render::outside_cells(full, &spots) {
+                painter.rect_filled(Rect::from_min_max(to_s(r.min), to_s(r.max)), CornerRadius::ZERO, Color32::from_black_alpha(render::SPOT_DIM));
+            }
+        }
+
         // Shapes.
         let shapes = self.shapes.clone();
         for (i, s) in shapes.iter().enumerate() {
-            if self.editing == Some(i) {
+            if self.editing == Some(i) && s.kind == Kind::Text {
                 continue;
             }
             self.draw_shape(&painter, s, &to_s, z, &ctx);
@@ -634,21 +753,27 @@ impl Editor {
         if let Some(i) = self.editing {
             if i < self.shapes.len() {
                 let s = self.shapes[i].clone();
-                let pos = to_s(s.a);
-                let size = text_px(s.width) * z;
+                let callout = s.kind == Kind::Callout;
+                let (pos, size, color) = if callout {
+                    let px = render::callout_px(s.width);
+                    let (bubble, _) = render::callout_geom(&s, self.text_dims(&s.text, px));
+                    (to_s(bubble.min + Vec2::splat(render::callout_pad(px))), px * z, contrast(s.color))
+                } else {
+                    (to_s(s.a), text_px(s.width) * z, s.color)
+                };
                 let mut text = s.text.clone();
                 let mut done = false;
                 egui::Area::new(egui::Id::new(("textedit", s.id))).fixed_pos(pos - vec2(4.0, 2.0)).order(egui::Order::Foreground).show(&ctx, |ui| {
                     if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)) || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
                         done = true;
                     }
-                    egui::Frame::new().stroke(Stroke::new(1.0, ACCENT.gamma_multiply(0.8))).corner_radius(CornerRadius::same(3)).inner_margin(egui::Margin::symmetric(3, 1)).show(ui, |ui| {
+                    egui::Frame::new().stroke(Stroke::new(1.0, if callout { Color32::TRANSPARENT } else { ACCENT.gamma_multiply(0.8) })).corner_radius(CornerRadius::same(3)).inner_margin(egui::Margin::symmetric(3, 1)).show(ui, |ui| {
                         let te = egui::TextEdit::multiline(&mut text)
                             .font(egui::FontId::new(size.max(6.0), egui::FontFamily::Name("annot".into())))
-                            .text_color(s.color)
+                            .text_color(color)
                             .frame(egui::Frame::NONE)
                             .desired_rows(1)
-                            .desired_width((self.bounds(&s).width() * z + size).max(size * 3.0))
+                            .desired_width(if callout { (self.text_dims(&s.text, render::callout_px(s.width)).0 * z + size).max(size * 3.0) } else { (self.bounds(&s).width() * z + size).max(size * 3.0) })
                             .hint_text(egui::RichText::new("Type…").color(FAINT));
                         let r = ui.add(te);
                         if self.focus_edit {
@@ -677,6 +802,7 @@ impl Editor {
                         if resp.hover_pos().and_then(|p| self.hit(to_i(p), 4.0 / z)).is_some() { egui::CursorIcon::Move } else { egui::CursorIcon::Default }
                     }
                     Tool::Draw(Kind::Text) => egui::CursorIcon::Text,
+                    Tool::Pick => egui::CursorIcon::Cell,
                     _ => egui::CursorIcon::Crosshair,
                 }
             };
@@ -702,6 +828,7 @@ impl Editor {
                         }
                     }
                     Tool::Crop => self.crop_drag = Some(clamp_to(p, &self.base)),
+                    Tool::Pick => self.pick(p),
                     Tool::Draw(Kind::Text) | Tool::Draw(Kind::Step) => {}
                     Tool::Draw(k) => {
                         let s = self.new_shape(k, p);
@@ -711,6 +838,9 @@ impl Editor {
             }
         }
         if resp.dragged_by(egui::PointerButton::Primary) {
+            if let (Some(p), Tool::Pick) = (pp, self.tool) {
+                self.pick(p);
+            }
             if let Some(p) = pp {
                 if let (Some(last), Some(i)) = (self.moving, self.selected) {
                     let d = p - last;
@@ -738,12 +868,12 @@ impl Editor {
                             }
                             s.b = q;
                         }
-                        Kind::Line | Kind::Arrow if shift => {
+                        Kind::Line | Kind::Arrow | Kind::Curve if shift => {
                             let d = p - s.a;
                             let ang = (d.y.atan2(d.x) / std::f32::consts::FRAC_PI_4).round() * std::f32::consts::FRAC_PI_4;
                             s.b = s.a + vec2(ang.cos(), ang.sin()) * d.length();
                         }
-                        Kind::Rect | Kind::Ellipse | Kind::Blur if shift => {
+                        Kind::Rect | Kind::Ellipse | Kind::Blur | Kind::Spotlight if shift => {
                             let d = p - s.a;
                             let m = d.x.abs().max(d.y.abs());
                             s.b = s.a + vec2(m * d.x.signum(), m * d.y.signum());
@@ -771,7 +901,12 @@ impl Editor {
                 };
                 if big {
                     self.snapshot();
+                    let callout = s.kind == Kind::Callout;
                     self.shapes.push(s);
+                    if callout {
+                        self.editing = Some(self.shapes.len() - 1);
+                        self.focus_edit = true;
+                    }
                 }
             }
         }
@@ -781,6 +916,7 @@ impl Editor {
             self.finish_edit();
             match self.tool {
                 Tool::Select => self.selected = self.hit(p, slop),
+                Tool::Pick => self.pick(p),
                 Tool::Crop => {
                     if self.crop.is_some() {
                         self.snapshot();
@@ -805,6 +941,20 @@ impl Editor {
                         self.focus_edit = true;
                     }
                 }
+                Tool::Draw(Kind::Callout) => {
+                    if let Some(i) = self.hit(p, slop).filter(|&i| self.shapes[i].kind == Kind::Callout) {
+                        self.editing = Some(i);
+                        self.focus_edit = true;
+                    } else if !was_editing {
+                        // A click drops a bubble up and to the right, its tail pointing at the click.
+                        let mut s = self.new_shape(Kind::Callout, p);
+                        s.b = p + vec2(60.0, -70.0);
+                        self.snapshot();
+                        self.shapes.push(s);
+                        self.editing = Some(self.shapes.len() - 1);
+                        self.focus_edit = true;
+                    }
+                }
                 Tool::Draw(_) => {
                     // A click on an existing shape selects it for recolouring/deleting.
                     self.selected = self.hit(p, slop);
@@ -813,12 +963,24 @@ impl Editor {
         }
         if resp.double_clicked() {
             if let Some(p) = pp {
-                if let Some(i) = self.hit(p, slop).filter(|&i| self.shapes[i].kind == Kind::Text) {
+                if let Some(i) = self.hit(p, slop).filter(|&i| matches!(self.shapes[i].kind, Kind::Text | Kind::Callout)) {
                     self.editing = Some(i);
                     self.focus_edit = true;
                 }
             }
         }
+    }
+
+    /// Eyedropper: takes the colour under `p` from the capture.
+    fn pick(&mut self, p: Pos2) {
+        let (x, y) = (p.x.floor() as i32, p.y.floor() as i32);
+        if x < 0 || y < 0 || x >= self.base.w as i32 || y >= self.base.h as i32 {
+            return;
+        }
+        let i = ((y as u32 * self.base.w + x as u32) * 4) as usize;
+        let c = Color32::from_rgb(self.base.px[i + 2], self.base.px[i + 1], self.base.px[i]);
+        self.custom = Some(c);
+        self.set_color(c);
     }
 
     fn draw_shape(&mut self, p: &egui::Painter, s: &Shape, to_s: &dyn Fn(Pos2) -> Pos2, z: f32, ctx: &egui::Context) {
@@ -860,6 +1022,31 @@ impl Editor {
             Kind::Text => {
                 p.text(to_s(s.a), egui::Align2::LEFT_TOP, &s.text, egui::FontId::new((text_px(s.width) * z).max(1.0), egui::FontFamily::Name("annot".into())), s.color);
             }
+            Kind::Spotlight => {
+                if self.drawing.as_ref().is_some_and(|d| d.id == s.id) {
+                    p.rect_stroke(Rect::from_two_pos(to_s(s.a), to_s(s.b)), CornerRadius::ZERO, Stroke::new(1.0, Color32::from_white_alpha(160)), StrokeKind::Outside);
+                }
+            }
+            Kind::Curve => {
+                let c = render::curve_ctrl(s.a, s.b);
+                let (end, tri) = render::arrow_geom(c, s.b, s.width);
+                let pts: Vec<Pos2> = render::curve_pts_to(s.a, c, end, 32).into_iter().map(|q| to_s(q)).collect();
+                p.add(egui::Shape::line(pts, st));
+                p.circle_filled(to_s(s.a), w / 2.0, s.color);
+                p.add(egui::Shape::convex_polygon(tri.iter().map(|q| to_s(*q)).collect(), s.color, Stroke::new(w * 0.5, s.color)));
+            }
+            Kind::Callout => {
+                let px = render::callout_px(s.width);
+                let (bubble, tri) = render::callout_geom(s, self.text_dims(&s.text, px));
+                let br = Rect::from_min_max(to_s(bubble.min), to_s(bubble.max));
+                p.add(egui::Shape::convex_polygon(tri.iter().map(|q| to_s(*q)).collect(), s.color, Stroke::NONE));
+                p.rect_filled(br, CornerRadius::same((render::callout_radius(px) * z).min(120.0) as u8), s.color);
+                let editing_this = self.editing.and_then(|i| self.shapes.get(i)).is_some_and(|e| e.id == s.id);
+                if !editing_this {
+                    let pad = render::callout_pad(px);
+                    p.text(to_s(bubble.min + Vec2::splat(pad)), egui::Align2::LEFT_TOP, &s.text, egui::FontId::new((px * z).max(1.0), egui::FontFamily::Name("annot".into())), contrast(s.color));
+                }
+            }
             Kind::Blur => {
                 let r = Rect::from_two_pos(s.a, s.b);
                 let sr = Rect::from_min_max(to_s(r.min), to_s(r.max));
@@ -872,6 +1059,16 @@ impl Editor {
                 }
             }
         }
+    }
+}
+
+fn format_of(path: &std::path::Path) -> crate::config::ImgFormat {
+    use crate::config::ImgFormat;
+    match path.extension().map(|e| e.to_string_lossy().to_lowercase()).as_deref() {
+        Some("jpg") | Some("jpeg") => ImgFormat::Jpg,
+        Some("webp") => ImgFormat::Webp,
+        Some("avif") => ImgFormat::Avif,
+        _ => ImgFormat::Png,
     }
 }
 
@@ -902,7 +1099,24 @@ fn icon_button(ui: &mut egui::Ui, icon: &str, active: bool, tip: &str) -> egui::
     if let Some(bg) = bg {
         ui.painter().rect_filled(r, CornerRadius::same(8), bg);
     }
-    ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, icon, ui::icon_font(18.0), if active { Color32::from_rgb(0xC3, 0xCF, 0xFF) } else if resp.hovered() { TEXT } else { MUTED });
+    let fg = if active { Color32::from_rgb(0xC3, 0xCF, 0xFF) } else if resp.hovered() { TEXT } else { MUTED };
+    let c = r.center();
+    match icon {
+        "curve" => {
+            let (a, b) = (c + vec2(-7.0, 6.0), c + vec2(7.0, -5.0));
+            let ctl = render::curve_ctrl(a, b);
+            let (end, tri) = render::arrow_geom(ctl, b, 1.6);
+            ui.painter().add(egui::Shape::line(render::curve_pts_to(a, ctl, end, 16), Stroke::new(1.6, fg)));
+            ui.painter().add(egui::Shape::convex_polygon(tri.to_vec(), fg, Stroke::NONE));
+        }
+        "spot" => {
+            ui.painter().rect_filled(Rect::from_center_size(c, vec2(18.0, 16.0)), CornerRadius::same(3), fg.gamma_multiply(0.35));
+            ui.painter().rect_filled(Rect::from_center_size(c, vec2(9.0, 8.0)), CornerRadius::same(2), fg);
+        }
+        _ => {
+            ui.painter().text(c, egui::Align2::CENTER_CENTER, icon, ui::icon_font(18.0), fg);
+        }
+    }
     resp.on_hover_text(tip)
 }
 
@@ -942,7 +1156,7 @@ impl eframe::App for Editor {
             if let Some(img) = shot {
                 let im = Image::from_rgba(img.size[0] as u32, img.size[1] as u32, img.as_raw());
                 let _ = crate::output::write_png(&dir.join("editor-ui.png"), &im, true);
-                let _ = crate::output::write_png(&dir.join("editor-export.png"), &self.flatten(), true);
+                let _ = crate::output::write_png(&dir.join("editor-export.png"), &self.export(), true);
                 self.closing = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
@@ -975,7 +1189,7 @@ impl eframe::App for Editor {
                     }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(egui::RichText::new("Wheel to zoom · Space+drag to pan · 0 to fit · Shift for straight lines / squares").small().color(FAINT));
+                    ui.label(egui::RichText::new("Wheel to zoom · Space+drag to pan · 0 to fit · Shift for straight lines / squares · F beautify").small().color(FAINT));
                 });
             });
         });

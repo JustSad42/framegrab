@@ -11,6 +11,11 @@ egui = "0.37"
 png = "0.18"
 gif = "0.14"
 tiny-skia = "0.11"
+jpeg-encoder = "0.7"
+image-webp = "0.2"
+ravif = { version = "0.13", default-features = false, features = ["threading"] }
+rgb = "0.8"
+rqrr = "0.11"
 ab_glyph = "0.2"
 rfd = "0.18"
 serde = { version = "1", features = ["derive"] }
@@ -44,6 +49,8 @@ windows = { version = "0.62", features = [
     "Win32_Media_Multimedia",
     "Win32_Security",
     "Win32_Storage_FileSystem",
+    "Win32_Storage_Xps",
+    "Win32_System_SystemServices",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_DataExchange",
@@ -61,6 +68,9 @@ windows = { version = "0.62", features = [
     "Win32_UI_Shell_Common",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[dev-dependencies]
+qrcode = { version = "0.14", default-features = false }
 
 [build-dependencies]
 winresource = "0.1"

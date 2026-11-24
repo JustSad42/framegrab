@@ -7,12 +7,26 @@ use windows::Win32::Foundation::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-pub static PRTSC: AtomicBool = AtomicBool::new(true);
-pub static WIN_SHIFT_S: AtomicBool = AtomicBool::new(true);
+/// Tray "Pause hotkeys" switch, and set while a full-screen game/app is in front (if enabled).
+pub static PAUSED: AtomicBool = AtomicBool::new(false);
+pub static GAME: AtomicBool = AtomicBool::new(false);
+static BINDINGS: std::sync::RwLock<Vec<(crate::config::Hotkey, Cmd)>> = std::sync::RwLock::new(Vec::new());
+static SWALLOW_VK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Installs the key table from the settings.
+pub fn set_bindings(cfg: &crate::config::Config) {
+    let h = &cfg.hotkeys;
+    let mut v = vec![(h.snip, Cmd::Region), (h.screen, Cmd::Screen), (h.window, Cmd::Window), (h.all, Cmd::AllScreens), (h.text, Cmd::Text), (h.scroll, Cmd::Scroll), (h.record, Cmd::Record), (h.menu, Cmd::Menu)];
+    if cfg.hook_win_shift_s {
+        v.push((crate::config::Hotkey { vk: 'S' as u32, ctrl: false, shift: true, alt: false, win: true }, Cmd::Region));
+    }
+    v.retain(|b| b.0.is_set());
+    *BINDINGS.write().unwrap() = v;
+}
 /// While true, overlay keys (Esc, Enter, arrows, digits...) are swallowed and sent to the host.
 pub static ROUTE: AtomicBool = AtomicBool::new(false);
 static HOST: AtomicIsize = AtomicIsize::new(0);
-static SWALLOW_UP: AtomicBool = AtomicBool::new(false);
+
 
 const MARK: usize = 0x46475242; // "FGRB": our own injected keys
 
@@ -26,6 +40,7 @@ pub enum Cmd {
     Text = 5,
     Scroll = 6,
     Record = 7,
+    Menu = 8,
 }
 
 impl Cmd {
@@ -38,6 +53,7 @@ impl Cmd {
             5 => Cmd::Text,
             6 => Cmd::Scroll,
             7 => Cmd::Record,
+            8 => Cmd::Menu,
             _ => return None,
         })
     }
@@ -50,6 +66,7 @@ impl Cmd {
             "text" => Cmd::Text,
             "scroll" => Cmd::Scroll,
             "record" => Cmd::Record,
+            "menu" => Cmd::Menu,
             _ => return None,
         })
     }
@@ -57,19 +74,6 @@ impl Cmd {
 
 fn down(vk: VIRTUAL_KEY) -> bool {
     unsafe { GetAsyncKeyState(vk.0 as i32) < 0 }
-}
-
-/// Which command PrtSc means with the modifiers currently held.
-pub fn prtsc_cmd(ctrl: bool, shift: bool, alt: bool, winkey: bool) -> Cmd {
-    match (ctrl, shift, alt, winkey) {
-        (_, _, _, true) => Cmd::AllScreens,
-        (true, true, _, _) => Cmd::Record,
-        (true, false, true, _) => Cmd::Scroll,
-        (true, false, false, _) => Cmd::Text,
-        (false, true, _, _) => Cmd::Screen,
-        (false, false, true, _) => Cmd::Window,
-        _ => Cmd::Region,
-    }
 }
 
 /// An unassigned key press so the shell doesn't open Start when Win is released.
@@ -95,31 +99,26 @@ unsafe extern "system" fn proc_(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                 let is_up = wp.0 as u32 == WM_KEYUP || wp.0 as u32 == WM_SYSKEYUP;
                 let winkey = down(VK_LWIN) || down(VK_RWIN);
 
-                if vk == VK_SNAPSHOT && PRTSC.load(Relaxed) {
-                    if is_down {
-                        let cmd = prtsc_cmd(down(VK_CONTROL), down(VK_SHIFT), down(VK_MENU), winkey);
+                if is_up && SWALLOW_VK.load(Relaxed) == vk.0 as u32 {
+                    SWALLOW_VK.store(0, Relaxed);
+                    return LRESULT(1);
+                }
+                if is_down && !PAUSED.load(Relaxed) && !GAME.load(Relaxed) && !matches!(vk, VK_CONTROL | VK_LCONTROL | VK_RCONTROL | VK_SHIFT | VK_LSHIFT | VK_RSHIFT | VK_MENU | VK_LMENU | VK_RMENU | VK_LWIN | VK_RWIN) {
+                    let (ctrl, shift, alt) = (down(VK_CONTROL), down(VK_SHIFT), down(VK_MENU));
+                    let hit = BINDINGS.read().ok().and_then(|b| b.iter().find(|(h, _)| h.vk == vk.0 as u32 && h.ctrl == ctrl && h.shift == shift && h.alt == alt && h.win == winkey).map(|b| b.1));
+                    if let Some(cmd) = hit {
                         if winkey {
                             mask_win();
                         }
+                        SWALLOW_VK.store(vk.0 as u32, Relaxed);
                         win::post(host, win::WM_CMD, cmd as usize, 0);
+                        return LRESULT(1);
                     }
-                    return LRESULT(1);
-                }
-                if vk.0 == 'S' as u16 && WIN_SHIFT_S.load(Relaxed) && winkey && down(VK_SHIFT) && !down(VK_CONTROL) {
-                    if is_down {
-                        mask_win();
-                        win::post(host, win::WM_CMD, Cmd::Region as usize, 0);
-                        SWALLOW_UP.store(true, Relaxed);
-                    }
-                    return LRESULT(1);
-                }
-                if is_up && vk.0 == 'S' as u16 && SWALLOW_UP.swap(false, Relaxed) {
-                    return LRESULT(1);
-                }
-                if ROUTE.load(Relaxed) {
+                }                if ROUTE.load(Relaxed) {
                     let routed = matches!(vk, VK_ESCAPE | VK_RETURN | VK_SPACE | VK_TAB | VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN)
                         || (0x31..=0x35).contains(&vk.0)
-                        || vk.0 == 'F' as u16;
+                        || vk.0 == 'F' as u16
+                        || vk.0 == 'C' as u16;
                     if routed && !winkey && !down(VK_CONTROL) && !down(VK_MENU) {
                         if is_down {
                             win::post(host, win::WM_KEYROUTE, vk.0 as usize, 0);
@@ -155,17 +154,3 @@ pub fn start(host: HWND) {
         .ok();
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn prtsc_mapping() {
-        assert_eq!(prtsc_cmd(false, false, false, false), Cmd::Region);
-        assert_eq!(prtsc_cmd(false, true, false, false), Cmd::Screen);
-        assert_eq!(prtsc_cmd(false, false, true, false), Cmd::Window);
-        assert_eq!(prtsc_cmd(true, false, false, false), Cmd::Text);
-        assert_eq!(prtsc_cmd(true, true, false, false), Cmd::Record);
-        assert_eq!(prtsc_cmd(true, false, true, false), Cmd::Scroll);
-        assert_eq!(prtsc_cmd(false, false, false, true), Cmd::AllScreens);
-    }
-}

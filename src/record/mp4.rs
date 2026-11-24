@@ -175,4 +175,51 @@ mod tests {
         assert!(out[0] >= 234 && out[0] <= 236);
         assert!((out[16] as i32 - 128).abs() <= 1);
     }
+
+    /// Worst case for 1080p60: every frame changes. `cargo test --release bench_1080p60 -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_1080p60() {
+        use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+        fn cpu() -> f64 {
+            let (mut a, mut b, mut k, mut u) = Default::default();
+            unsafe { GetProcessTimes(GetCurrentProcess(), &mut a, &mut b, &mut k, &mut u).unwrap() };
+            let t = |f: windows::Win32::Foundation::FILETIME| ((f.dwHighDateTime as u64) << 32 | f.dwLowDateTime as u64) as f64 / 1e7;
+            t(k) + t(u)
+        }
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
+        }
+        let (w, h, fps, n) = (1920usize, 1080usize, 60u32, 600i64);
+        let dir = std::env::var("FRAMEGRAB_OUT").unwrap_or_else(|_| std::env::temp_dir().display().to_string());
+        let path = std::path::Path::new(&dir).join("bench-1080p60.mp4");
+        let mp4 = super::Mp4::new(&path, w as u32, h as u32, fps, false).unwrap();
+        let mut px = vec![0u8; w * h * 4];
+        let mut nv12 = Vec::new();
+        let dur = 10_000_000 / fps as i64;
+        let (t0, c0) = (std::time::Instant::now(), cpu());
+        let mut conv = 0.0;
+        for f in 0..n {
+            // Moving gradient + scrolling bars: nothing repeats between frames.
+            for y in 0..h {
+                let row = &mut px[y * w * 4..(y + 1) * w * 4];
+                for (x, p) in row.chunks_exact_mut(4).enumerate() {
+                    let v = (x + y + f as usize * 7) as u8;
+                    p[0] = v;
+                    p[1] = ((y + f as usize * 3) % 256) as u8;
+                    p[2] = if (x / 40 + f as usize) % 2 == 0 { 230 } else { 30 };
+                    p[3] = 255;
+                }
+            }
+            let tc = std::time::Instant::now();
+            super::bgra_to_nv12(&px, w, h, &mut nv12);
+            conv += tc.elapsed().as_secs_f64();
+            mp4.video(&nv12, f * dur, dur).unwrap();
+        }
+        mp4.finish().unwrap();
+        let (wall, c) = (t0.elapsed().as_secs_f64(), cpu() - c0);
+        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
+        println!("1080p60 x{n}: wall {wall:.2}s (incl. synthetic frame drawing) = {:.0} fps, convert {:.2} ms/frame, process CPU {c:.2}s => {:.1}% of all {cores} cores over a 10 s recording", n as f64 / wall, conv * 1000.0 / n as f64, c / 10.0 / cores * 100.0);
+        println!("file: {} ({} KB)", path.display(), std::fs::metadata(&path).map(|m| m.len() / 1024).unwrap_or(0));
+    }
 }

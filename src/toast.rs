@@ -19,6 +19,7 @@ pub enum Action {
     Folder = 4,
     Delete = 5,
     Close = 6,
+    Upload = 7,
 }
 
 impl Action {
@@ -30,13 +31,14 @@ impl Action {
             4 => Action::Folder,
             5 => Action::Delete,
             6 => Action::Close,
+            7 => Action::Upload,
             _ => return None,
         })
     }
 }
 
 pub enum Content {
-    Image { thumb: Image, size: (u32, u32), status: String },
+    Image { thumb: Image, size: (u32, u32), status: String, upload: bool },
     Text { text: String, status: String },
     Video { thumb: Option<Image>, status: String, detail: String },
 }
@@ -62,6 +64,7 @@ struct Toast {
 
 thread_local! {
     static T: RefCell<Option<Toast>> = const { RefCell::new(None) };
+    static DRAGGED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 const CLASS: &str = "FramegrabToast";
@@ -74,6 +77,18 @@ pub fn init() {
 
 fn with<R>(f: impl FnOnce(&mut Toast) -> R) -> Option<R> {
     T.with(|t| t.try_borrow_mut().ok().and_then(|mut t| t.as_mut().map(f)))
+}
+
+/// Replaces the status line (e.g. "Uploading…", "Link copied") and keeps the card up a bit longer.
+pub fn set_status(s: &str) {
+    with(|t| {
+        match &mut t.content {
+            Content::Image { status, .. } | Content::Text { status, .. } | Content::Video { status, .. } => *status = s.to_string(),
+        }
+        t.left_ms = t.left_ms.max(3000);
+        t.fading_out = false;
+        win::invalidate(t.hwnd);
+    });
 }
 
 pub fn path() -> Option<PathBuf> {
@@ -103,7 +118,8 @@ pub fn show(host: HWND, content: Content, path: Option<PathBuf>, seconds: u32) {
     let (cx, cy) = crate::capture::cursor_pos();
     let Some(m) = mons.iter().find(|m| m.rect.contains(cx, cy)).or_else(|| mons.iter().find(|m| m.primary)).or(mons.first()).cloned() else { return };
     let s = m.scale();
-    let cw = (340.0 * s) as i32;
+    let wide_card = matches!(&content, Content::Image { upload: true, .. });
+    let cw = ((if wide_card { 384.0 } else { 340.0 }) * s) as i32;
     let pad = (12.0 * s) as i32;
     let body_h = match &content {
         Content::Image { thumb, .. } => {
@@ -188,6 +204,7 @@ fn layout(t: &Toast) -> Vec<(Action, Rect)> {
     let gap = (6.0 * s) as i32;
     let mut out = Vec::new();
     let acts: &[Action] = match t.content {
+        Content::Image { upload: true, .. } => &[Action::Edit, Action::Text, Action::Copy, Action::Upload, Action::Folder, Action::Delete],
         Content::Image { .. } => &[Action::Edit, Action::Text, Action::Copy, Action::Folder, Action::Delete],
         Content::Text { .. } => &[Action::Copy],
         Content::Video { .. } => &[Action::Folder, Action::Delete],
@@ -264,6 +281,7 @@ fn paint(t: &mut Toast) {
             Action::Copy => (icon::COPY, if matches!(t.content, Content::Text { .. }) { "Copy again" } else { "" }),
             Action::Folder => (icon::FOLDER_OPEN, if matches!(t.content, Content::Video { .. }) { "Show in folder" } else { "" }),
             Action::Delete => (icon::TRASH, ""),
+            Action::Upload => (icon::UPLOAD, ""),
             Action::Close => (icon::X, ""),
         };
         if *a == Action::Close {
@@ -376,7 +394,32 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                 SetCursor(LoadCursorW(None, if over { IDC_HAND } else { IDC_ARROW }).ok());
                 LRESULT(1)
             }
+            WM_LBUTTONDOWN => {
+                let (x, y) = win::lparam_xy(lp);
+                // Dragging the thumbnail drags the file out (Discord, browser, Explorer…).
+                let on_thumb = with(|t| matches!(t.content, Content::Image { .. }) && hit(t, x, y).is_none() && y < t.h - (56.0 * t.scale) as i32).unwrap_or(false);
+                if on_thumb {
+                    let mut pt = POINT { x, y };
+                    let _ = windows::Win32::Graphics::Gdi::ClientToScreen(h, &mut pt);
+                    if windows::Win32::UI::Input::KeyboardAndMouse::DragDetect(h, pt).as_bool() {
+                        with(|t| {
+                            t.inside = true;
+                            DRAGGED.with(|d| d.set(true));
+                        });
+                        if let Some(f) = crate::app::last_file() {
+                            if crate::dragout::drag_file(&f) {
+                                set_status("Dropped");
+                            }
+                        }
+                        with(|t| t.inside = false);
+                    }
+                }
+                LRESULT(0)
+            }
             WM_LBUTTONUP => {
+                if DRAGGED.with(|d| d.replace(false)) {
+                    return LRESULT(0);
+                }
                 let (x, y) = win::lparam_xy(lp);
                 let r = with(|t| {
                     let a = hit(t, x, y).or_else(|| (matches!(t.content, Content::Image { .. }) && y < t.h - (56.0 * t.scale) as i32).then_some(Action::Edit));

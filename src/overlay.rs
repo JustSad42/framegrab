@@ -32,7 +32,7 @@ pub const MODES: [(Mode, &str, &str); 5] = [
 impl Mode {
     pub fn hint(self) -> &'static str {
         match self {
-            Mode::Region => "Drag to select  ·  click a window  ·  Esc to cancel",
+            Mode::Region => "Drag to select  ·  click a window  ·  C zoom & colour  ·  Esc to cancel",
             Mode::Screen => "Click a monitor  ·  Enter captures all monitors",
             Mode::Text => "Drag over text to copy it  ·  click a window to read all of it",
             Mode::Scroll => "Select the area that scrolls  ·  Framegrab scrolls it for you",
@@ -45,6 +45,10 @@ pub struct Done {
     pub mode: Mode,
     pub rect: Option<Rect>,
     pub shot: Shot,
+    /// Set when a window was clicked (not dragged): capture that window itself.
+    pub window: Option<isize>,
+    /// Window under the middle of the selection (for the app name in file names).
+    pub under: Option<isize>,
 }
 
 struct OWin {
@@ -73,7 +77,7 @@ pub struct Overlay {
     wins: Vec<OWin>,
     s: Option<Session>,
     pub headless: bool,
-    finished: Option<(Mode, Option<Rect>)>,
+    finished: Option<(Mode, Option<Rect>, Option<isize>)>,
 }
 
 thread_local! {
@@ -164,12 +168,13 @@ pub fn show_with(mode: Mode, shot: Shot, cfg: &crate::config::Config) {
 pub fn take_result() -> Option<Done> {
     let (res, hwnds) = with(|o| {
         let s = o.s.take()?;
-        let (mode, rect) = o.finished.take().unwrap_or((s.mode, None));
+        let (mode, rect, window) = o.finished.take().unwrap_or((s.mode, None, None));
+        let under = window.or_else(|| rect.and_then(|r| s.snaps.iter().find(|w| w.rect.contains(r.x + r.w / 2, r.y + r.h / 2)).map(|w| w.hwnd)));
         for w in &mut o.wins {
             w.bmp = None;
             w.bmp_size = (0, 0);
         }
-        Some((Done { mode, rect, shot: s.shot }, o.wins.iter().map(|w| w.hwnd).collect::<Vec<_>>()))
+        Some((Done { mode, rect, shot: s.shot, window, under }, o.wins.iter().map(|w| w.hwnd).collect::<Vec<_>>()))
     })??;
     unsafe {
         for h in hwnds {
@@ -325,11 +330,19 @@ impl Overlay {
     }
 
     fn finish(&mut self, rect: Option<Rect>) {
+        self.finish_win(rect, None);
+    }
+
+    fn finish_win(&mut self, rect: Option<Rect>, window: Option<isize>) {
         if self.s.is_none() || self.finished.is_some() {
             return;
         }
         let mode = self.s.as_ref().map(|s| s.mode).unwrap_or(Mode::Region);
-        self.finished = Some((mode, rect));
+        if crate::config::test_mode() {
+            let c = self.s.as_ref().map(|s| (s.cursor, s.hover_btn, s.shot.mons.iter().map(|m| m.rect).collect::<Vec<_>>(), s.snaps.len()));
+            crate::app::log(&format!("finish {mode:?} rect={rect:?} window={window:?} cursor/hover={c:?}"));
+        }
+        self.finished = Some((mode, rect, window));
         win::post(self.host, win::WM_OVERLAY_DONE, 0, 0);
     }
 
@@ -406,8 +419,8 @@ impl Overlay {
                 self.invalidate();
             }
         } else {
-            let r = target_rect(s);
-            self.finish(r);
+            let (r, w) = target(s);
+            self.finish_win(r, w);
         }
     }
 
@@ -434,8 +447,8 @@ impl Overlay {
                     let all = crate::capture::virtual_rect(&s.shot.mons);
                     self.finish(Some(all));
                 } else {
-                    let r = target_rect(s);
-                    self.finish(r);
+                    let (r, w) = target(s);
+                    self.finish_win(r, w);
                 }
             }
             VK_TAB => {
@@ -460,6 +473,10 @@ impl Overlay {
                 if (0x31..=0x35).contains(&k) {
                     s.mode = MODES[(k - 0x31) as usize].0;
                     self.invalidate();
+                } else if k == 'C' as u32 {
+                    // Zoom + colour readout only when asked for (or always, if set in Settings).
+                    s.magnifier = !s.magnifier;
+                    self.invalidate();
                 } else if k == 'F' as u32 {
                     let r = s.shot.mons.iter().find(|m| m.rect.contains(s.cursor.0, s.cursor.1)).map(|m| m.rect);
                     self.finish(r);
@@ -467,6 +484,20 @@ impl Overlay {
             }
         }
     }
+}
+
+/// What a click would capture: (rect, window handle when it's a window).
+fn target(s: &Session) -> (Option<Rect>, Option<isize>) {
+    let (x, y) = s.cursor;
+    if s.mode != Mode::Screen {
+        let vr = crate::capture::virtual_rect(&s.shot.mons);
+        if let Some(w) = s.snaps.iter().find(|w| w.rect.contains(x, y)) {
+            if let Some(r) = w.rect.intersect(&vr) {
+                return (Some(r), Some(w.hwnd));
+            }
+        }
+    }
+    (s.shot.mons.iter().find(|m| m.rect.contains(x, y)).map(|m| m.rect), None)
 }
 
 /// What a click would capture: the window under the cursor, else its monitor.
