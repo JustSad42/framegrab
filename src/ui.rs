@@ -22,8 +22,15 @@ pub fn bold(size: f32) -> FontId {
 }
 
 pub fn install(ctx: &egui::Context) {
-    let mut fonts = egui::FontDefinitions::default();
+    // Windows' own fonts only (egui's bundled fonts are left out of the exe).
+    let mut fonts = egui::FontDefinitions::empty();
     let win = std::path::Path::new("C:\\Windows\\Fonts");
+    for (name, file, family) in [("segoe-fallback", "arial.ttf", FontFamily::Proportional), ("mono", "consola.ttf", FontFamily::Monospace)] {
+        if let Ok(b) = std::fs::read(win.join(file)) {
+            fonts.font_data.insert(name.into(), Arc::new(egui::FontData::from_owned(b)));
+            fonts.families.entry(family).or_default().push(name.into());
+        }
+    }
     fonts.font_data.insert("phosphor".into(), Arc::new(egui::FontData::from_static(crate::gfx::ICON_FONT)));
     if let Ok(b) = std::fs::read(win.join("segoeui.ttf")) {
         fonts.font_data.insert("segoe".into(), Arc::new(egui::FontData::from_owned(b)));
@@ -46,6 +53,9 @@ pub fn install(ctx: &egui::Context) {
     fonts.families.insert(FontFamily::Name("bold".into()), bold);
     fonts.families.insert(FontFamily::Name("icons".into()), vec!["phosphor".into()]);
     fonts.families.entry(FontFamily::Proportional).or_default().push("phosphor".into());
+    // Monospace falls back to Segoe/phosphor too, so no family is ever empty.
+    let prop = fonts.families[&FontFamily::Proportional].clone();
+    fonts.families.entry(FontFamily::Monospace).or_default().extend(prop);
     ctx.set_fonts(fonts);
 
     ctx.all_styles_mut(|s| {

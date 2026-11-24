@@ -103,12 +103,19 @@ const TIMER_SCROLL: usize = 10;
 const TIMER_REC: usize = 11;
 const TIMER_TRIM: usize = 12;
 const TIMER_GAME: usize = 13;
+const TIMER_PREWARM: usize = 14;
 
 /// After a capture: once everything is closed, drop the cached image and hand memory back.
 fn schedule_trim() {
+    // Wait a while: captures in a burst stay at full speed, and an idle PC still gets the
+    // memory back (paging it in again costs ~30 ms on the next capture).
+    schedule_trim_in(30_000);
+}
+
+fn schedule_trim_in(ms: u32) {
     if let Some(h) = with(|a| a.host) {
         unsafe {
-            SetTimer(Some(h), TIMER_TRIM, 2000, None);
+            SetTimer(Some(h), TIMER_TRIM, ms, None);
         }
     }
 }
@@ -153,8 +160,10 @@ pub fn run(background: bool) {
     }
     crate::updater::spawn_auto(host, cfg.auto_update);
     log(&format!("started in {} ms", t0.elapsed().as_millis()));
-    // Hand start-up memory back to Windows once things settle; it pages back in on first use.
-    schedule_trim();
+    // Build the overlay windows a moment later so start-up (and sign-in) isn't held up.
+    unsafe {
+        SetTimer(Some(host), TIMER_PREWARM, 1500, None);
+    }
     if !background && !config::test_mode() {
         notify(host, "Framegrab is running", "Press Print Screen to capture. Open Framegrab again for Settings.");
     }
@@ -896,7 +905,14 @@ fn handle_jobs() {
                     let status = match out.kind {
                         crate::ocr::Kind::Qr => "QR code copied".to_string(),
                         crate::ocr::Kind::Table => format!("Table copied ({} rows)", t.lines().count()),
+                        crate::ocr::Kind::Link => "Link copied".to_string(),
+                        crate::ocr::Kind::Email => "Email address copied".to_string(),
+                        crate::ocr::Kind::Code => "Code copied".to_string(),
                         crate::ocr::Kind::Text => format!("Copied {n} characters"),
+                    };
+                    let status = match &out.note {
+                        Some(note) => format!("{status} · {note}"),
+                        None => status,
                     };
                     toast::show(host, Content::Text { text: t, status }, None, cfg.toolbar_seconds);
                 }
@@ -943,6 +959,38 @@ fn copydata(s: &str) {
             if let Ok(vk) = rest.parse::<u32>() {
                 route_key(vk);
             }
+        }
+        "gfx-selftest" => {
+            // Draws through the real window path (shared GPU device + swap chain) in a window
+            // parked far off-screen, then reads it back with PrintWindow.
+            let h = win::create(host_class(), "fg-selftest", WS_POPUP, WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, -20000, -20000, 320, 160, None);
+            unsafe {
+                let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
+            }
+            let mut rep = String::new();
+            if let Some(c) = crate::gfx::Canvas::new(h, 320, 160) {
+                for _ in 0..2 {
+                    c.begin();
+                    c.clear(0xFF202028);
+                    c.round(20.0, 20.0, 120.0, 60.0, 10.0, 0xFF6E8BFF);
+                    c.text("Framegrab", 20.0, 90.0, 280.0, 40.0, 24.0, 600, 0xFFFFFFFF, crate::gfx::Align::Left);
+                    rep += &format!("end ok={} ", c.end());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                let img = crate::winfo::print_window(h.0 as isize, Rect::new(-20000, -20000, 320, 160));
+                rep += &format!("readback={}", img.is_some());
+                if let Some(img) = img {
+                    let _ = output::write_png(&std::path::Path::new(rest).join("gfx-selftest.png"), &img, true);
+                    let px = |x: u32, y: u32| { let i = ((y * img.w + x) * 4) as usize; (img.px[i + 2], img.px[i + 1], img.px[i]) };
+                    rep += &format!(" bg={:?} box={:?}", px(5, 5), px(80, 50));
+                }
+            } else {
+                rep += "no canvas";
+            }
+            unsafe {
+                let _ = DestroyWindow(h);
+            }
+            let _ = std::fs::write(std::path::Path::new(rest).join("gfx-selftest.txt"), rep);
         }
         "state" => {
             use std::io::Write;
@@ -1079,6 +1127,11 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                     TIMER_REC => rec_tick(),
                     TIMER_TRIM => trim_tick(h),
                     TIMER_GAME => game_tick(),
+                    TIMER_PREWARM => {
+                        let _ = KillTimer(Some(h), TIMER_PREWARM);
+                        overlay::prewarm();
+                        schedule_trim_in(3000);
+                    }
                     crate::updater::TIMER_ID => crate::updater::on_timer(h),
                     _ => {}
                 }

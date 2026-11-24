@@ -21,6 +21,7 @@ mod record;
 mod scroll;
 mod settings;
 mod toast;
+mod translate;
 mod ui;
 mod updater;
 mod winfo;

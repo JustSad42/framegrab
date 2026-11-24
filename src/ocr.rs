@@ -99,12 +99,17 @@ pub enum Kind {
     Text,
     Table,
     Qr,
+    Link,
+    Email,
+    Code,
 }
 
 #[derive(Clone, Debug)]
 pub struct OcrOut {
     pub text: String,
     pub kind: Kind,
+    /// Extra status, e.g. "Translated from German" or why translation didn't happen.
+    pub note: Option<String>,
 }
 
 /// Recognizes text with word positions. Run off the UI thread.
@@ -267,27 +272,99 @@ pub fn read_qr(img: &Image) -> Option<(String, f32)> {
     None
 }
 
-/// Text grab per the settings: QR code, table (TSV) or text in the chosen layout.
+const URL_CHARS: &str = "-._~:/?#[]@!$&'()*+,;=%";
+
+/// If the whole text is a single link, email address or code (OCR may split it with spaces),
+/// returns just that item.
+pub fn single_item(text: &str) -> Option<(Kind, String)> {
+    let tokens = text.split_whitespace().count();
+    let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+    if compact.is_empty() || tokens > 3 {
+        return None;
+    }
+    let lower = compact.to_lowercase();
+    let url_chars = |s: &str| s.chars().all(|c| c.is_ascii_alphanumeric() || URL_CHARS.contains(c));
+    if (lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("www.")) && compact.len() > 8 && compact.contains('.') && url_chars(&compact) {
+        return Some((Kind::Link, compact));
+    }
+    if tokens <= 2 && compact.matches('@').count() == 1 {
+        let (local, domain) = compact.split_once('@')?;
+        let ok = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "._%+-".contains(c));
+        let tld = domain.rsplit('.').next().unwrap_or("");
+        if ok(local) && ok(domain) && domain.contains('.') && tld.len() >= 2 && tld.chars().all(|c| c.is_ascii_alphabetic()) {
+            return Some((Kind::Email, compact));
+        }
+    }
+    let digits: String = compact.chars().filter(|c| *c != '-').collect();
+    if (4..=8).contains(&digits.len()) && digits.chars().all(|c| c.is_ascii_digit()) {
+        return Some((Kind::Code, digits));
+    }
+    // A bare domain with a path, like github.com/user/repo.
+    if tokens == 1 && url_chars(&compact) && compact.contains('/') {
+        let host = compact.split('/').next().unwrap_or("");
+        let tld = host.rsplit('.').next().unwrap_or("");
+        if host.contains('.') && tld.len() >= 2 && tld.chars().all(|c| c.is_ascii_alphabetic()) {
+            return Some((Kind::Link, compact));
+        }
+    }
+    None
+}
+
+fn language_name(code: &str) -> String {
+    let names = [("en", "English"), ("de", "German"), ("fr", "French"), ("es", "Spanish"), ("it", "Italian"), ("pt", "Portuguese"), ("nl", "Dutch"), ("pl", "Polish"), ("ru", "Russian"), ("uk", "Ukrainian"), ("ja", "Japanese"), ("ko", "Korean"), ("zh", "Chinese"), ("ar", "Arabic"), ("tr", "Turkish"), ("sv", "Swedish"), ("da", "Danish"), ("fi", "Finnish"), ("no", "Norwegian"), ("nb", "Norwegian"), ("cs", "Czech"), ("el", "Greek"), ("hu", "Hungarian"), ("ro", "Romanian"), ("he", "Hebrew"), ("hi", "Hindi"), ("id", "Indonesian"), ("th", "Thai"), ("vi", "Vietnamese")];
+    let c = code.to_lowercase();
+    let c = c.split('-').next().unwrap_or("");
+    names.iter().find(|n| n.0 == c).map(|n| n.1.to_string()).unwrap_or(code.to_uppercase())
+}
+
+/// Text grab per the settings: QR code, table (TSV), a lone link/code/email, or text in the
+/// chosen layout (translated if that's set up).
 pub fn grab_text(img: &Image, cfg: &crate::config::Config) -> Result<OcrOut, String> {
     let qr = if cfg.read_qr { read_qr(img) } else { None };
     if let Some((q, frac)) = &qr {
         if *frac > 0.15 {
-            return Ok(OcrOut { text: q.clone(), kind: Kind::Qr });
+            return Ok(OcrOut { text: q.clone(), kind: Kind::Qr, note: None });
         }
     }
     let lines = recognize_lines(img, &cfg.ocr_language)?;
     if lines.is_empty() {
         if let Some((q, _)) = qr {
-            return Ok(OcrOut { text: q, kind: Kind::Qr });
+            return Ok(OcrOut { text: q, kind: Kind::Qr, note: None });
         }
-        return Ok(OcrOut { text: String::new(), kind: Kind::Text });
+        return Ok(OcrOut { text: String::new(), kind: Kind::Text, note: None });
     }
     if cfg.detect_tables {
         if let Some(t) = table(&lines) {
-            return Ok(OcrOut { text: t, kind: Kind::Table });
+            return Ok(OcrOut { text: t, kind: Kind::Table, note: None });
         }
     }
-    Ok(OcrOut { text: layout(&lines, cfg.text_layout), kind: Kind::Text })
+    let text = layout(&lines, cfg.text_layout);
+    if cfg.smart_copy {
+        if let Some((kind, item)) = single_item(&text) {
+            return Ok(OcrOut { text: item, kind, note: None });
+        }
+    }
+    Ok(finish_text(text, cfg))
+}
+
+/// Translates plain text when translation is set up; otherwise returns it as is.
+pub fn finish_text(text: String, cfg: &crate::config::Config) -> OcrOut {
+    if cfg.translate.provider == crate::config::TranslateProvider::Off || text.trim().is_empty() {
+        return OcrOut { text, kind: Kind::Text, note: None };
+    }
+    let target = crate::translate::target(&cfg.translate);
+    match crate::translate::translate(&cfg.translate, &text) {
+        Ok((t, src)) => {
+            let same = src.as_deref().is_some_and(|s| s.split('-').next() == Some(target.as_str())) || t.trim() == text.trim();
+            if same {
+                OcrOut { text, kind: Kind::Text, note: None }
+            } else {
+                let from = src.map(|s| format!(" from {}", language_name(&s))).unwrap_or_default();
+                OcrOut { text: t, kind: Kind::Text, note: Some(format!("Translated{from}")) }
+            }
+        }
+        Err(e) => OcrOut { text, kind: Kind::Text, note: Some(format!("Not translated: {e}")) },
+    }
 }
 
 #[cfg(test)]
@@ -301,6 +378,16 @@ mod tests {
         let lines = vec![line(&[("Hello", 0.0, 0.0), ("wor-", 50.0, 0.0)]), line(&[("ld", 0.0, 20.0), ("again", 30.0, 20.0)]), line(&[("New", 0.0, 70.0)])];
         assert_eq!(layout(&lines, crate::config::TextLayout::Paragraphs), "Hello world again\nNew");
         assert_eq!(layout(&lines, crate::config::TextLayout::SingleLine), "Hello wor- ld again New");
+    }
+    #[test]
+    fn single_items() {
+        assert_eq!(single_item("https://exa mple.com/a?b=1"), Some((Kind::Link, "https://example.com/a?b=1".into())));
+        assert_eq!(single_item("github.com/JustSad42/framegrab"), Some((Kind::Link, "github.com/JustSad42/framegrab".into())));
+        assert_eq!(single_item("name.surname@mail.co.uk"), Some((Kind::Email, "name.surname@mail.co.uk".into())));
+        assert_eq!(single_item("482 913"), Some((Kind::Code, "482913".into())));
+        assert_eq!(single_item("Your code is 482913"), None);
+        assert_eq!(single_item("Hello world"), None);
+        assert_eq!(single_item("3.14"), None);
     }
     #[test]
     fn reads_qr() {

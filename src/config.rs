@@ -80,6 +80,26 @@ impl Default for Upload {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug, Default)]
+pub enum TranslateProvider {
+    #[default]
+    Off,
+    Libre,
+    DeepL,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Default)]
+#[serde(default)]
+pub struct Translate {
+    pub provider: TranslateProvider,
+    /// Two-letter target language; empty = Windows' display language.
+    pub target: String,
+    /// LibreTranslate server (e.g. https://libretranslate.com).
+    pub url: String,
+    /// LibreTranslate or DeepL API key.
+    pub key: String,
+}
+
 /// A key combination. `vk` 0 = unbound.
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug, Default)]
 #[serde(default)]
@@ -228,6 +248,9 @@ pub struct Config {
     pub beautify_radius: u32,
     pub beautify_shadow: bool,
     pub upload: Upload,
+    /// When the grabbed text is just a link, code or email address, copy only that.
+    pub smart_copy: bool,
+    pub translate: Translate,
 }
 
 impl Default for Config {
@@ -273,6 +296,8 @@ impl Default for Config {
             beautify_radius: 12,
             beautify_shadow: true,
             upload: Upload::default(),
+            smart_copy: true,
+            translate: Translate::default(),
         }
     }
 }

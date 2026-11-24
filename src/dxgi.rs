@@ -34,6 +34,15 @@ fn device_for(adapter: &IDXGIAdapter1) -> Option<(ID3D11Device, ID3D11DeviceCont
     if let Some(d) = DEVICES.with(|d| d.borrow().iter().find(|e| e.0 == key).map(|e| (e.1.clone(), e.2.clone()))) {
         return Some(d);
     }
+    // Same GPU as this thread's window-drawing device: use that one.
+    if let Some((dev, luid)) = crate::gfx::shared_d3d() {
+        if luid == key {
+            if let Ok(ctx) = unsafe { dev.GetImmediateContext() } {
+                DEVICES.with(|d| d.borrow_mut().push((key, dev.clone(), ctx.clone())));
+                return Some((dev, ctx));
+            }
+        }
+    }
     let mut dev = None;
     let mut ctx = None;
     unsafe {

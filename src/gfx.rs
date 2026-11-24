@@ -25,7 +25,8 @@ pub mod col {
     pub const BLACK: u32 = 0xFF000000;
 }
 
-pub const ICON_FONT: &[u8] = include_bytes!("../assets/phosphor.ttf");
+/// Only the icons the code uses (scripts/subset_icons.py builds it from assets/phosphor.ttf).
+pub const ICON_FONT: &[u8] = include_bytes!("../assets/phosphor-min.ttf");
 
 pub mod icon {
     pub const SELECTION: &str = "\u{E626}";
@@ -57,6 +58,40 @@ pub struct Factories {
     pub dw: IDWriteFactory,
     pub icons: Option<IDWriteFontCollection>,
     formats: RefCell<HashMap<(u32, u32, bool), IDWriteTextFormat>>,
+    /// One GPU device shared by every window (overlays, card, bar); created on first use.
+    gpu: RefCell<Option<Gpu>>,
+}
+
+/// The shared D3D11 + D2D device. A separate HwndRenderTarget per window would each create
+/// their own device (and driver memory) behind the scenes.
+#[derive(Clone)]
+struct Gpu {
+    d3d: windows::Win32::Graphics::Direct3D11::ID3D11Device,
+    d2d: ID2D1Device,
+    dxgi: windows::Win32::Graphics::Dxgi::IDXGIFactory2,
+}
+
+impl Gpu {
+    fn new(d2d_factory: &ID2D1Factory) -> Option<Gpu> {
+        use windows::Win32::Foundation::HMODULE;
+        use windows::Win32::Graphics::Direct3D::*;
+        use windows::Win32::Graphics::Direct3D11::*;
+        use windows::Win32::Graphics::Dxgi::*;
+        unsafe {
+            let mut dev = None;
+            let flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+            D3D11CreateDevice(None, D3D_DRIVER_TYPE_HARDWARE, HMODULE::default(), flags, Some(&[D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0]), D3D11_SDK_VERSION, Some(&mut dev), None, None)
+                .or_else(|_| D3D11CreateDevice(None, D3D_DRIVER_TYPE_WARP, HMODULE::default(), flags, None, D3D11_SDK_VERSION, Some(&mut dev), None, None))
+                .ok()?;
+            let d3d: ID3D11Device = dev?;
+            let dxgi_dev: IDXGIDevice = d3d.cast().ok()?;
+            let f1: ID2D1Factory1 = d2d_factory.cast().ok()?;
+            let d2d = f1.CreateDevice(&dxgi_dev).ok()?;
+            let adapter = dxgi_dev.GetAdapter().ok()?;
+            let dxgi: IDXGIFactory2 = adapter.GetParent().ok()?;
+            Some(Gpu { d3d, d2d, dxgi })
+        }
+    }
 }
 
 thread_local! {
@@ -67,14 +102,40 @@ pub fn fact() -> &'static Factories {
     FACT.with(|f| *f)
 }
 
+/// The shared window-drawing device and its adapter LUID, so screen capture on the same GPU
+/// can reuse it instead of creating another device.
+pub fn shared_d3d() -> Option<(windows::Win32::Graphics::Direct3D11::ID3D11Device, i64)> {
+    use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+    // Only an existing device: threads that never draw shouldn't create one.
+    let g = fact().gpu.borrow().clone()?;
+    unsafe {
+        let luid = g.d3d.cast::<IDXGIDevice>().ok()?.GetAdapter().ok()?.GetDesc().ok()?.AdapterLuid;
+        Some((g.d3d.clone(), ((luid.HighPart as i64) << 32) | luid.LowPart as i64))
+    }
+}
+
 impl Factories {
     fn new() -> Self {
         unsafe {
             let d2d: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None).expect("d2d");
             let dw: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).expect("dwrite");
             let icons = load_icons(&dw).ok();
-            Self { d2d, dw, icons, formats: RefCell::new(HashMap::new()) }
+            Self { d2d, dw, icons, formats: RefCell::new(HashMap::new()), gpu: RefCell::new(None) }
         }
+    }
+
+    fn gpu(&self) -> Option<Gpu> {
+        let mut g = self.gpu.borrow_mut();
+        if g.is_none() {
+            *g = Gpu::new(&self.d2d);
+        }
+        g.clone()
+    }
+
+    /// Forgets the shared device after it was lost (driver update, GPU reset); the next
+    /// canvas creates a new one.
+    fn drop_gpu(&self) {
+        *self.gpu.borrow_mut() = None;
     }
 
     /// Text format keyed by (pixel size*10, weight, icon font).
@@ -149,39 +210,66 @@ pub enum Align {
     Right,
 }
 
-/// A render target bound to a window plus one reusable brush.
+/// A render target bound to a window (a flip-model swap chain on the shared GPU device) or an
+/// off-screen WIC bitmap, plus one reusable brush.
 pub struct Canvas {
     pub rt: ID2D1RenderTarget,
-    hwnd_rt: Option<ID2D1HwndRenderTarget>,
+    swap: Option<(windows::Win32::Graphics::Dxgi::IDXGISwapChain1, ID2D1DeviceContext)>,
     wic: Option<windows::Win32::Graphics::Imaging::IWICBitmap>,
     brush: ID2D1SolidColorBrush,
     dash: Option<ID2D1StrokeStyle>,
 }
 
+fn bind_backbuffer(swap: &windows::Win32::Graphics::Dxgi::IDXGISwapChain1, dc: &ID2D1DeviceContext) -> Option<()> {
+    use windows::Win32::Graphics::Dxgi::IDXGISurface;
+    unsafe {
+        let surface: IDXGISurface = swap.GetBuffer(0).ok()?;
+        let props = D2D1_BITMAP_PROPERTIES1 {
+            pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_IGNORE },
+            dpiX: 96.0,
+            dpiY: 96.0,
+            bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+            colorContext: std::mem::ManuallyDrop::new(None),
+        };
+        let target = dc.CreateBitmapFromDxgiSurface(&surface, Some(&props)).ok()?;
+        dc.SetTarget(&target);
+        Some(())
+    }
+}
+
 impl Canvas {
     pub fn new(hwnd: HWND, w: u32, h: u32) -> Option<Canvas> {
+        use windows::Win32::Graphics::Dxgi::*;
+        let gpu = fact().gpu()?;
         unsafe {
-            let props = D2D1_RENDER_TARGET_PROPERTIES {
-                r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
-                pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
-                dpiX: 96.0,
-                dpiY: 96.0,
+            let desc = DXGI_SWAP_CHAIN_DESC1 {
+                Width: w.max(1),
+                Height: h.max(1),
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+                BufferCount: 2,
+                Scaling: DXGI_SCALING_NONE,
+                SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                AlphaMode: DXGI_ALPHA_MODE_IGNORE,
+                Flags: 0,
                 ..Default::default()
             };
-            let hp = D2D1_HWND_RENDER_TARGET_PROPERTIES { hwnd, pixelSize: D2D_SIZE_U { width: w.max(1), height: h.max(1) }, presentOptions: D2D1_PRESENT_OPTIONS_NONE };
-            let hrt = fact().d2d.CreateHwndRenderTarget(&props, &hp).ok()?;
-            Self::wrap(hrt.cast().ok()?, Some(hrt), None)
+            let swap = gpu.dxgi.CreateSwapChainForHwnd(&gpu.d3d, hwnd, &desc, None, None).ok()?;
+            let dc = gpu.d2d.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE).ok()?;
+            bind_backbuffer(&swap, &dc)?;
+            Self::wrap(dc.cast().ok()?, Some((swap, dc)), None)
         }
     }
 
-    fn wrap(rt: ID2D1RenderTarget, hwnd_rt: Option<ID2D1HwndRenderTarget>, wic: Option<windows::Win32::Graphics::Imaging::IWICBitmap>) -> Option<Canvas> {
+    fn wrap(rt: ID2D1RenderTarget, swap: Option<(windows::Win32::Graphics::Dxgi::IDXGISwapChain1, ID2D1DeviceContext)>, wic: Option<windows::Win32::Graphics::Imaging::IWICBitmap>) -> Option<Canvas> {
         unsafe {
             rt.SetDpi(96.0, 96.0);
             rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
             let brush = rt.CreateSolidColorBrush(&color(col::WHITE), None).ok()?;
             let sp = D2D1_STROKE_STYLE_PROPERTIES { dashStyle: D2D1_DASH_STYLE_CUSTOM, ..Default::default() };
             let dash = fact().d2d.CreateStrokeStyle(&sp, Some(&[4.0, 4.0])).ok();
-            Some(Canvas { rt, hwnd_rt, wic, brush, dash })
+            Some(Canvas { rt, swap, wic, brush, dash })
         }
     }
 
@@ -220,10 +308,12 @@ impl Canvas {
     }
 
     pub fn resize(&self, w: u32, h: u32) {
-        if let Some(h_rt) = &self.hwnd_rt {
+        if let Some((swap, dc)) = &self.swap {
             unsafe {
-                let _ = h_rt.Resize(&D2D_SIZE_U { width: w.max(1), height: h.max(1) });
+                dc.SetTarget(None);
+                let _ = swap.ResizeBuffers(0, w.max(1), h.max(1), DXGI_FORMAT_UNKNOWN, windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_FLAG(0));
             }
+            let _ = bind_backbuffer(swap, dc);
         }
     }
 
@@ -233,7 +323,18 @@ impl Canvas {
 
     /// Returns false when the target must be recreated.
     pub fn end(&self) -> bool {
-        unsafe { self.rt.EndDraw(None, None).is_ok() }
+        unsafe {
+            let ok = self.rt.EndDraw(None, None).is_ok();
+            let presented = match &self.swap {
+                // No vsync wait: DWM composes the newest frame, so the overlay appears sooner.
+                Some((swap, _)) => swap.Present(0, windows::Win32::Graphics::Dxgi::DXGI_PRESENT(0)).is_ok(),
+                None => true,
+            };
+            if !(ok && presented) && self.swap.is_some() {
+                fact().drop_gpu();
+            }
+            ok && presented
+        }
     }
 
     pub fn clear(&self, c: u32) {

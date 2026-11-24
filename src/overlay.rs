@@ -93,9 +93,21 @@ pub fn init(host: HWND) {
     win::register_class(CLASS, Some(wndproc));
     let headless = std::env::var_os("FRAMEGRAB_HEADLESS").is_some();
     OV.with(|o| *o.borrow_mut() = Some(Overlay { host, wins: Vec::new(), s: None, headless, finished: None }));
-    // Create the windows and GPU targets now so the first capture is as fast as later ones.
+}
+
+/// Creates the windows and GPU targets ahead of time so the first capture is as fast as later
+/// ones. Runs shortly after start-up; a capture before then simply creates them itself.
+pub fn prewarm() {
+    let t = std::time::Instant::now();
     let mons = crate::capture::monitors();
-    with(|o| o.ensure_windows(&Shot { mons, imgs: Vec::new() }));
+    with(|o| {
+        if o.s.is_none() {
+            o.ensure_windows(&Shot { mons, imgs: Vec::new() });
+        }
+    });
+    // Creates (and caches) the capture devices; the duplications themselves are cheap to reopen.
+    drop(crate::dxgi::open_all());
+    crate::app::log(&format!("overlay prewarmed in {} ms", t.elapsed().as_millis()));
 }
 
 /// Rebuilds the overlay windows after a display change.
@@ -198,7 +210,7 @@ pub fn release_memory() {
             }
         }
     });
-    crate::dxgi::release_devices();
+    // The D3D devices stay: re-creating them made the next capture ~35 ms slower.
 }
 
 pub fn cancel() {

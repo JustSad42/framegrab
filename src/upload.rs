@@ -2,7 +2,17 @@
 //! ShareX-style endpoint that accepts a multipart file upload.
 
 use crate::config::{Upload, UploadProvider};
-use std::time::Duration;
+
+/// HTTP client using Windows' own TLS (SChannel), so no TLS library is bundled in the exe.
+pub fn http(timeout_secs: u64, status_as_error: bool) -> ureq::Agent {
+    use ureq::tls::{TlsConfig, TlsProvider};
+    ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(timeout_secs)))
+        .http_status_as_error(status_as_error)
+        .tls_config(TlsConfig::builder().provider(TlsProvider::NativeTls).build())
+        .build()
+        .into()
+}
 
 fn multipart(field: &str, filename: &str, mime: &str, bytes: &[u8]) -> (String, Vec<u8>) {
     let boundary = format!("----framegrab{:016x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(7));
@@ -36,7 +46,7 @@ pub fn mime(ext: &str) -> &'static str {
 
 /// Uploads and returns the link. Runs on a worker thread.
 pub fn upload(cfg: &Upload, bytes: &[u8], filename: &str, ext: &str) -> Result<String, String> {
-    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(90))).http_status_as_error(false).build().into();
+    let agent = http(90, false);
     let (url, field, header, path) = match cfg.provider {
         UploadProvider::Off => return Err("Uploads are off".into()),
         UploadProvider::Imgur => {
@@ -80,5 +90,17 @@ mod tests {
         assert_eq!(super::json_path(&v, "data.link").as_deref(), Some("https://i/x.png"));
         assert_eq!(super::json_path(&v, "files.0.url").as_deref(), Some("https://a"));
         assert_eq!(super::json_path(&v, "nope"), None);
+    }
+}
+
+#[cfg(test)]
+mod net_tests {
+    /// Network check of the Windows TLS client: `cargo test --release https_works -- --ignored`.
+    #[test]
+    #[ignore]
+    fn https_works() {
+        let mut r = super::http(15, false).get("https://api.github.com/zen").header("User-Agent", "Framegrab").call().expect("request");
+        assert_eq!(r.status().as_u16(), 200);
+        assert!(!r.body_mut().read_to_string().unwrap().is_empty());
     }
 }

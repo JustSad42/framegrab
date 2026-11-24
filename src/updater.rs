@@ -42,7 +42,7 @@ struct Asset {
 }
 
 fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(60))).build().into()
+    crate::upload::http(60, true)
 }
 
 fn get_bytes(url: &str, limit: u64) -> Result<Vec<u8>, String> {

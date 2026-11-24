@@ -1,7 +1,7 @@
 //! Settings window (egui). Everything here is set once; captures then apply it automatically.
 //! Changes save immediately and the running copy reloads them.
 
-use crate::config::{Config, Hotkey, Hotkeys, ImgFormat, NameInfo, RecFormat, TextLayout, UploadProvider};
+use crate::config::{Config, Hotkey, Hotkeys, ImgFormat, NameInfo, RecFormat, TextLayout, TranslateProvider, UploadProvider};
 use crate::ui::{self, ACCENT, BORDER, CARD, FAINT, MUTED, TEXT};
 use egui::{Color32, CornerRadius, RichText, Stroke};
 use std::sync::Mutex;
@@ -506,6 +506,25 @@ impl Settings {
         row(ui, "Line breaks", |ui| segmented(ui, &mut c.text_layout, &[(TextLayout::Lines, "As on screen"), (TextLayout::Paragraphs, "Join paragraphs"), (TextLayout::SingleLine, "One line")]));
         toggle(ui, &mut c.detect_tables, "Detect tables", "Columns are copied with tabs, so they paste as cells in Excel or Sheets");
         toggle(ui, &mut c.read_qr, "Read QR codes", "A QR code in the area is copied as its text or link");
+        toggle(ui, &mut c.smart_copy, "Copy just the link, code or email", "When that's all the area contains, e.g. a 2FA code split as \"482 913\"");
+        ui.separator();
+        let t = &mut c.translate;
+        row(ui, "Translate to", |ui| {
+            segmented(ui, &mut t.provider, &[(TranslateProvider::Off, "Off"), (TranslateProvider::Libre, "LibreTranslate"), (TranslateProvider::DeepL, "DeepL")]);
+        });
+        if t.provider == TranslateProvider::Off {
+            hint(ui, "Off: grabbed text stays on your PC. Turn on to translate it automatically before it's copied.");
+        } else {
+            let lang = crate::translate::ui_language();
+            text_field(ui, "Target language", &mut t.target, &format!("{lang}  (Windows language)"), false);
+            if t.provider == TranslateProvider::Libre {
+                text_field(ui, "Server", &mut t.url, "https://libretranslate.com or your own", false);
+                text_field(ui, "API key", &mut t.key, "optional for self-hosted servers", true);
+            } else {
+                text_field(ui, "API key", &mut t.key, "from deepl.com (free plan keys end in :fx)", true);
+            }
+            hint(ui, "Grabbed text is sent to this service. Text already in the target language, links, codes and tables are left as they are.");
+        }
     }
 
     fn uploads(&mut self, ui: &mut egui::Ui) {
