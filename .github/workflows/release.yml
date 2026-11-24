@@ -1,0 +1,47 @@
+# Builds Framegrab.exe and publishes a GitHub release whenever a version tag (v1.2.3) is pushed.
+# Installed copies find the new release, verify its SHA-256 and update themselves.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check version matches tag
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}".TrimStart("v")
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ($ver -ne $tag) { throw "Cargo.toml version $ver does not match tag $tag" }
+
+      - name: Test
+        run: cargo test --release
+
+      - name: Build
+        shell: pwsh
+        run: |
+          cargo build --release
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item target/release/framegrab.exe out/Framegrab.exe
+          $hash = (Get-FileHash out/Framegrab.exe -Algorithm SHA256).Hash.ToLower()
+          Set-Content out/Framegrab.exe.sha256 "$hash  Framegrab.exe" -NoNewline
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" out/Framegrab.exe out/Framegrab.exe.sha256 `
+            --title "Framegrab ${{ github.ref_name }}" --notes-from-tag
