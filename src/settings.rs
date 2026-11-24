@@ -17,13 +17,25 @@ struct Settings {
     paused: bool,
     /// Which hotkey row is waiting for a key combination.
     recording: Option<usize>,
+    page: usize,
 }
+
+const PAGES: [(&str, &str); 8] = [
+    ("\u{E2D8}", "Shortcuts"),
+    ("\u{E626}", "Capture"),
+    ("\u{E6A2}", "Windows & beautify"),
+    ("\u{E1DC}", "Selection overlay"),
+    ("\u{E3EE}", "Recording"),
+    ("\u{E6EE}", "Text grab"),
+    ("\u{E4C0}", "Uploads"),
+    ("\u{E434}", "General"),
+];
 
 static SHOT: std::sync::LazyLock<std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<egui::ColorImage>>>>> = std::sync::LazyLock::new(Default::default);
 
 pub fn run() {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_title("Framegrab Settings").with_inner_size([660.0, 820.0]).with_min_inner_size([560.0, 480.0]).with_icon(ui::app_icon()),
+        viewport: egui::ViewportBuilder::default().with_title("Framegrab Settings").with_inner_size([880.0, 640.0]).with_min_inner_size([760.0, 460.0]).with_icon(ui::app_icon()),
         centered: true,
         ..Default::default()
     };
@@ -34,7 +46,7 @@ pub fn run() {
             ui::install(&cc.egui_ctx);
             let cfg = Config::load();
             let paused = std::fs::read_to_string(crate::config::data_dir().join("status")).is_ok_and(|s| s.trim() == "paused");
-            Ok(Box::new(Settings { saved: cfg.clone(), cfg, langs: crate::ocr::languages(), snip_key: snip_key_setting(), update: None, frames: 0, paused, recording: None }))
+            Ok(Box::new(Settings { saved: cfg.clone(), cfg, langs: crate::ocr::languages(), snip_key: snip_key_setting(), update: None, frames: 0, paused, recording: None, page: 0 }))
         }),
     );
     recorder::stop();
@@ -148,8 +160,10 @@ mod recorder {
 }
 
 fn card(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
-    ui.label(RichText::new(title).font(ui::bold(14.0)).color(TEXT));
-    ui.add_space(2.0);
+    if !title.is_empty() {
+        ui.label(RichText::new(title).font(ui::bold(14.0)).color(TEXT));
+        ui.add_space(2.0);
+    }
     egui::Frame::new().fill(CARD).stroke(Stroke::new(1.0, BORDER)).corner_radius(CornerRadius::same(10)).inner_margin(egui::Margin::symmetric(14, 10)).show(ui, |ui| {
         ui.set_width(ui.available_width());
         body(ui);
@@ -369,7 +383,7 @@ impl Settings {
             }
         }
         toggle(ui, &mut self.cfg.hook_win_shift_s, "Win+Shift+S snips too", "Replaces the Snipping Tool shortcut");
-        hint(ui, "In the overlay: 1–5 or Tab switch mode · arrows nudge the cursor · Enter takes what's highlighted · Esc cancels");
+        hint(ui, "In the overlay: 1–5 or Tab switch mode · arrows nudge the cursor · C magnifier & colour · Enter takes what's highlighted · Esc cancels");
         if self.snip_key == Some(true) {
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
@@ -530,83 +544,105 @@ impl eframe::App for Settings {
             }
             if let Some(img) = SHOT.lock().unwrap().take() {
                 let im = crate::capture::Image::from_rgba(img.size[0] as u32, img.size[1] as u32, img.as_raw());
-                let _ = crate::output::write_png(&std::path::Path::new(&dir).join(format!("settings-{}.png", std::env::var("FRAMEGRAB_SETTINGS_SCROLL").unwrap_or_default())), &im, true);
+                let _ = crate::output::write_png(&std::path::Path::new(&dir).join(format!("settings-{}.png", std::env::var("FRAMEGRAB_SETTINGS_PAGE").unwrap_or_default())), &im, true);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             ctx.request_repaint();
         }
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(ui::BG).inner_margin(egui::Margin { left: 22, right: 22, top: 18, bottom: 10 })).show(ui, |ui| {
-            let mut sa = egui::ScrollArea::vertical().auto_shrink([false, false]);
+        if let Some(p) = std::env::var("FRAMEGRAB_SETTINGS_PAGE").ok().and_then(|v| v.parse::<usize>().ok()) {
+            self.page = p.min(PAGES.len() - 1);
+        }
+        egui::Panel::left("nav").resizable(false).exact_size(196.0).show_separator_line(false).frame(egui::Frame::new().fill(ui::PANEL).inner_margin(egui::Margin { left: 12, right: 12, top: 18, bottom: 12 })).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.add_space(6.0);
+                ui.label(RichText::new("Framegrab").font(ui::bold(17.0)).color(TEXT));
+                ui.label(RichText::new(format!("v{}", crate::updater::VERSION)).small().color(FAINT));
+            });
+            ui.add_space(14.0);
+            for (i, (icon, name)) in PAGES.iter().enumerate() {
+                let on = self.page == i;
+                let (r, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 34.0), egui::Sense::click());
+                if on || resp.hovered() {
+                    ui.painter().rect_filled(r, CornerRadius::same(8), if on { ACCENT.gamma_multiply(0.22) } else { Color32::from_white_alpha(8) });
+                }
+                let fg = if on { TEXT } else { MUTED };
+                ui.painter().text(egui::pos2(r.left() + 18.0, r.center().y), egui::Align2::CENTER_CENTER, *icon, ui::icon_font(16.0), if on { ACCENT } else { fg });
+                ui.painter().text(egui::pos2(r.left() + 36.0, r.center().y), egui::Align2::LEFT_CENTER, *name, egui::FontId::proportional(13.5), fg);
+                if resp.clicked() {
+                    self.page = i;
+                }
+            }
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                if ui.button("Quit Framegrab").on_hover_text("Stops the background app until you open it again or sign in").clicked() {
+                    crate::app::send_to_running("quit");
+                }
+                ui.add_space(4.0);
+                ui.label(RichText::new("Changes save automatically.\nOpen Framegrab again to get back here.").small().color(FAINT));
+            });
+        });
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(ui::BG).inner_margin(egui::Margin { left: 24, right: 24, top: 18, bottom: 10 })).show(ui, |ui| {
+            let mut sa = egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt(self.page);
             if let Some(y) = std::env::var("FRAMEGRAB_SETTINGS_SCROLL").ok().and_then(|v| v.parse::<f32>().ok()) {
                 sa = sa.vertical_scroll_offset(y);
             }
             sa.show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Framegrab").heading());
-                    ui.label(RichText::new(format!("v{}", crate::updater::VERSION)).color(FAINT));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new("Runs in the background · open Framegrab again to get here").small().color(FAINT));
-                    });
-                });
+                let (_, title) = PAGES[self.page];
+                ui.label(RichText::new(title).heading());
                 ui.add_space(10.0);
-                card(ui, "Shortcuts", |ui| self.shortcuts(ui));
-                card(ui, "After a capture", |ui| self.after_capture(ui));
-                card(ui, "Windows & beautify", |ui| self.windows_and_beautify(ui));
-                card(ui, "Selection overlay", |ui| {
-                    let c = &mut self.cfg;
-                    toggle(ui, &mut c.magnifier, "Always show the magnifier", "Pixel zoom and colour picker next to the cursor. When off, press C while snipping to show it.");
-                    toggle(ui, &mut c.crosshair, "Crosshair", "Faint guide lines through the cursor");
-                    toggle(ui, &mut c.capture_cursor, "Include the mouse pointer in screenshots", "");
-                });
-                card(ui, "Screen recording", |ui| {
-                    let c = &mut self.cfg;
-                    row(ui, "Format", |ui| segmented(ui, &mut c.rec_format, &[(RecFormat::Mp4, "MP4"), (RecFormat::Gif, "GIF")]));
-                    if c.rec_format == RecFormat::Mp4 {
-                        row(ui, "Frame rate", |ui| segmented(ui, &mut c.rec_fps, &[(15, "15"), (30, "30"), (60, "60")]));
-                        toggle(ui, &mut c.rec_system_audio, "Record system sound", "Remembered from the recording bar too");
-                        toggle(ui, &mut c.rec_mic, "Record microphone", "");
-                    } else {
-                        row(ui, "GIF frame rate", |ui| segmented(ui, &mut c.gif_fps, &[(10, "10"), (15, "15"), (20, "20")]));
-                        hint(ui, "GIFs are scaled to at most 960 px wide and have no sound.");
-                    }
-                    toggle(ui, &mut c.rec_cursor, "Show the mouse pointer", "");
-                    ui.separator();
-                    let d = Config { rec_dir: String::new(), ..c.clone() }.recordings_dir();
-                    folder_row(ui, "Recordings folder", &mut c.rec_dir, d);
-                });
-                card(ui, "Text grab", |ui| self.text_grab(ui));
-                card(ui, "Uploads", |ui| self.uploads(ui));
-                card(ui, "General", |ui| {
-                    let c = &mut self.cfg;
-                    toggle(ui, &mut c.start_with_windows, "Start with Windows", "Runs quietly in the background — no tray icon");
-                    toggle(ui, &mut c.auto_update, "Update automatically", "Checks GitHub releases; updates install while idle and are checksum-verified");
-                    ui.horizontal(|ui| {
-                        if ui.button("Check for updates").clicked() {
-                            let st = crate::updater::check();
-                            self.update = Some(match st {
-                                crate::updater::State::UpToDate => "You're on the latest version.".into(),
-                                crate::updater::State::Ready { version, .. } => format!("Version {version} downloaded; it installs the next time Framegrab is idle."),
-                                crate::updater::State::Error(e) => e,
-                                _ => String::new(),
-                            });
+                match self.page {
+                    0 => card(ui, "", |ui| self.shortcuts(ui)),
+                    1 => card(ui, "After a capture", |ui| self.after_capture(ui)),
+                    2 => card(ui, "Windows & beautify", |ui| self.windows_and_beautify(ui)),
+                    3 => card(ui, "While selecting", |ui| {
+                        let c = &mut self.cfg;
+                        toggle(ui, &mut c.magnifier, "Always show the magnifier", "Pixel zoom and colour picker next to the cursor. When off, press C while snipping to show it.");
+                        toggle(ui, &mut c.crosshair, "Crosshair", "Faint guide lines through the cursor");
+                        toggle(ui, &mut c.capture_cursor, "Include the mouse pointer in screenshots", "");
+                    }),
+                    4 => card(ui, "", |ui| {
+                        let c = &mut self.cfg;
+                        row(ui, "Format", |ui| segmented(ui, &mut c.rec_format, &[(RecFormat::Mp4, "MP4"), (RecFormat::Gif, "GIF")]));
+                        if c.rec_format == RecFormat::Mp4 {
+                            row(ui, "Frame rate", |ui| segmented(ui, &mut c.rec_fps, &[(15, "15"), (30, "30"), (60, "60")]));
+                            toggle(ui, &mut c.rec_system_audio, "Record system sound", "Remembered from the recording bar too");
+                            toggle(ui, &mut c.rec_mic, "Record microphone", "");
+                        } else {
+                            row(ui, "GIF frame rate", |ui| segmented(ui, &mut c.gif_fps, &[(10, "10"), (15, "15"), (20, "20")]));
+                            hint(ui, "GIFs are scaled to at most 960 px wide and have no sound.");
                         }
-                        if let Some(u) = &self.update {
-                            ui.label(RichText::new(u).small().color(MUTED));
-                        }
-                    });
-                    ui.separator();
-                    ui.horizontal(|ui| {
+                        toggle(ui, &mut c.rec_cursor, "Show the mouse pointer", "");
+                        ui.separator();
+                        let d = Config { rec_dir: String::new(), ..c.clone() }.recordings_dir();
+                        folder_row(ui, "Recordings folder", &mut c.rec_dir, d);
+                    }),
+                    5 => card(ui, "", |ui| self.text_grab(ui)),
+                    6 => card(ui, "", |ui| self.uploads(ui)),
+                    _ => card(ui, "", |ui| {
+                        let c = &mut self.cfg;
+                        toggle(ui, &mut c.start_with_windows, "Start with Windows", "Runs quietly in the background, no tray icon");
+                        toggle(ui, &mut c.auto_update, "Update automatically", "Checks GitHub releases; updates install while idle and are checksum-verified");
+                        ui.horizontal(|ui| {
+                            if ui.button("Check for updates").clicked() {
+                                let st = crate::updater::check();
+                                self.update = Some(match st {
+                                    crate::updater::State::UpToDate => "You're on the latest version.".into(),
+                                    crate::updater::State::Ready { version, .. } => format!("Version {version} downloaded; it installs the next time Framegrab is idle."),
+                                    crate::updater::State::Error(e) => e,
+                                    _ => String::new(),
+                                });
+                            }
+                            if let Some(u) = &self.update {
+                                ui.label(RichText::new(u).small().color(MUTED));
+                            }
+                        });
+                        ui.separator();
                         if ui.button("Edit an image…").clicked() {
                             if let Some(p) = rfd::FileDialog::new().add_filter("Images", &["png"]).pick_file() {
                                 crate::app::spawn_self(&["--edit", &p.to_string_lossy()]);
                             }
                         }
-                        if ui.button("Quit Framegrab").on_hover_text("Stops the background app until you open it again or sign in").clicked() {
-                            crate::app::send_to_running("quit");
-                        }
-                        ui.label(RichText::new("Settings save automatically.").small().color(FAINT));
-                    });
-                });
+                    }),
+                }
             });
         });
 

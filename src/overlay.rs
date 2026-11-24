@@ -67,7 +67,10 @@ struct Session {
     cursor: (i32, i32),
     drag: Option<(i32, i32)>,
     dragging: bool,
+    /// Mode-bar button under the cursor; `BAR_GAP` = on the bar but between buttons.
     hover_btn: Option<usize>,
+    /// What was highlighted before the cursor went onto the bar (kept while it's there).
+    last_hl: Option<Rect>,
     magnifier: bool,
     crosshair: bool,
 }
@@ -135,7 +138,7 @@ pub fn show_with(mode: Mode, shot: Shot, cfg: &crate::config::Config) {
                 w.upload(img);
             }
         }
-        o.s = Some(Session { mode, shot, snaps, cursor, drag: None, dragging: false, hover_btn: None, magnifier: cfg.magnifier, crosshair: cfg.crosshair });
+        o.s = Some(Session { mode, shot, snaps, cursor, drag: None, dragging: false, hover_btn: None, last_hl: None, magnifier: cfg.magnifier, crosshair: cfg.crosshair });
         o.finished = None;
         (o.wins.iter().map(|w| w.hwnd).collect::<Vec<_>>(), o.headless)
     });
@@ -236,6 +239,19 @@ pub fn sim(cmd: &str) {
         o.update_hover();
         o.invalidate();
     });
+}
+
+/// Test hook: hover state and what the screen highlights right now.
+pub fn debug_state() -> String {
+    with(|o| {
+        o.s.as_ref().map(|s| {
+            let on_bar = s.hover_btn.is_some();
+            let hl = if s.dragging { None } else if on_bar { s.last_hl } else { target_rect(s) };
+            format!("cursor={:?} hover={:?} highlight={:?}", s.cursor, s.hover_btn.map(|b| if b == BAR_GAP { -1 } else { b as i64 }), hl)
+        })
+    })
+    .flatten()
+    .unwrap_or_default()
 }
 
 /// Test hook: renders each monitor's overlay off-screen and saves PNGs (scaled by `div`).
@@ -351,12 +367,16 @@ impl Overlay {
         s.hover_btn = None;
         if s.drag.is_none() {
             if let Some(m) = s.shot.mons.iter().find(|m| m.rect.contains(s.cursor.0, s.cursor.1)) {
-                for (i, r) in bar_layout(m.rect, m.scale()).iter().enumerate() {
-                    if r.contains(s.cursor.0, s.cursor.1) {
-                        s.hover_btn = Some(i);
-                    }
+                let btns = bar_layout(m.rect, m.scale());
+                // The whole bar (padding and gaps between buttons too) counts, so sliding
+                // across it never flips the screen highlight on and off.
+                if bar_panel(&btns, m.scale()).contains(s.cursor.0, s.cursor.1) {
+                    s.hover_btn = Some(btns.iter().position(|r| r.contains(s.cursor.0, s.cursor.1)).unwrap_or(BAR_GAP));
                 }
             }
+        }
+        if s.hover_btn.is_none() {
+            s.last_hl = target_rect(s);
         }
     }
 
@@ -378,6 +398,9 @@ impl Overlay {
         self.update_hover();
         let s = self.s.as_mut().unwrap();
         if let Some(b) = s.hover_btn {
+            if b == BAR_GAP {
+                return;
+            }
             if b < MODES.len() {
                 s.mode = MODES[b].0;
             } else {
@@ -512,6 +535,17 @@ fn target_rect(s: &Session) -> Option<Rect> {
 }
 
 /// Mode-bar buttons (five modes + close) in virtual-screen coordinates for a monitor.
+const BAR_GAP: usize = usize::MAX;
+
+/// The bar's background panel plus the hint row under it.
+fn bar_panel(btns: &[Rect], s: f32) -> Rect {
+    let (first, last) = (btns[0], *btns.last().unwrap());
+    let (px, py) = ((6.0 * s) as i32, (4.0 * s) as i32);
+    let x = first.x - px;
+    let y = first.y - py;
+    Rect::new(x, y, last.right() + px - x, first.h + py * 2 + (40.0 * s) as i32)
+}
+
 fn bar_layout(m: Rect, s: f32) -> Vec<Rect> {
     let f = gfx::fact();
     let h = (40.0 * s) as i32;
@@ -548,7 +582,7 @@ fn render(c: &Canvas, bmp: Option<&ID2D1Bitmap>, w: &OWin, s: &Session) {
     let hl = if s.dragging {
         s.drag.map(|d| Rect::from_points(d, s.cursor))
     } else if on_bar {
-        None
+        s.last_hl
     } else {
         target_rect(s)
     };
@@ -630,7 +664,11 @@ fn render(c: &Canvas, bmp: Option<&ID2D1Bitmap>, w: &OWin, s: &Session) {
                 c.icon(icon::X, x, y, ww, hh, 16.0 * sc, fg);
             }
         }
-        let hint = s.mode.hint();
+        // Hovering a mode previews what it does; the screen itself stays as it is.
+        let hint = match s.hover_btn {
+            Some(i) if i < MODES.len() => MODES[i].0.hint(),
+            _ => s.mode.hint(),
+        };
         let fs = 12.5 * sc;
         let tw = gfx::fact().measure(hint, fs, 400) + 24.0 * sc;
         let th = 28.0 * sc;
@@ -700,8 +738,13 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
     unsafe {
         match msg {
             WM_SETCURSOR => {
-                let over_bar = with(|o| o.s.as_ref().is_some_and(|s| s.hover_btn.is_some())).unwrap_or(false);
-                SetCursor(LoadCursorW(None, if over_bar { IDC_HAND } else { IDC_CROSS }).ok());
+                let hover = with(|o| o.s.as_ref().and_then(|s| s.hover_btn)).flatten();
+                let cur = match hover {
+                    Some(BAR_GAP) => IDC_ARROW,
+                    Some(_) => IDC_HAND,
+                    None => IDC_CROSS,
+                };
+                SetCursor(LoadCursorW(None, cur).ok());
                 LRESULT(1)
             }
             WM_MOUSEMOVE => {

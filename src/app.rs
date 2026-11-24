@@ -944,6 +944,12 @@ fn copydata(s: &str) {
                 route_key(vk);
             }
         }
+        "state" => {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(rest) {
+                let _ = writeln!(f, "{}", overlay::debug_state());
+            }
+        }
         "dump" => {
             let files = overlay::dump(std::path::Path::new(rest));
             let _ = std::fs::write(std::path::Path::new(rest).join("dump.txt"), files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n"));
