@@ -73,6 +73,35 @@ struct Session {
     last_hl: Option<Rect>,
     magnifier: bool,
     crosshair: bool,
+    snap: bool,
+}
+
+/// Brightness lookup across all monitors of a frozen screenshot (desktop coordinates).
+fn shot_luma(shot: &Shot, x: i32, y: i32) -> Option<i32> {
+    let i = shot.mons.iter().position(|m| m.rect.contains(x, y))?;
+    let m = shot.mons[i].rect;
+    crate::snap::luma(shot.imgs.get(i)?, x - m.x, y - m.y)
+}
+
+/// While dragging a selection: snaps the start (once, when the drag begins) and the moving
+/// corner to nearby edges, unless snapping is off or Alt is held.
+fn apply_snap(s: &mut Session, starting: bool) {
+    let alt = unsafe { GetAsyncKeyState(VK_MENU.0 as i32) } < 0;
+    if !s.snap || alt || s.mode == Mode::Screen {
+        return;
+    }
+    let scale = s.shot.mons.iter().find(|m| m.rect.contains(s.cursor.0, s.cursor.1)).map(|m| m.scale()).unwrap_or(1.0);
+    let r = (8.0 * scale).round() as i32;
+    let shot = &s.shot;
+    let lum = |x: i32, y: i32| shot_luma(shot, x, y);
+    if starting {
+        if let Some(d) = s.drag {
+            s.drag = Some(crate::snap::snap_point(&lum, d, r));
+        }
+    }
+    if let Some(d) = s.drag {
+        s.cursor = crate::snap::snap_corner(&lum, d, s.cursor, r);
+    }
 }
 
 pub struct Overlay {
@@ -150,7 +179,7 @@ pub fn show_with(mode: Mode, shot: Shot, cfg: &crate::config::Config) {
                 w.upload(img);
             }
         }
-        o.s = Some(Session { mode, shot, snaps, cursor, drag: None, dragging: false, hover_btn: None, last_hl: None, magnifier: cfg.magnifier, crosshair: cfg.crosshair });
+        o.s = Some(Session { mode, shot, snaps, cursor, drag: None, dragging: false, hover_btn: None, last_hl: None, magnifier: cfg.magnifier, crosshair: cfg.crosshair, snap: cfg.snap_edges });
         o.finished = None;
         (o.wins.iter().map(|w| w.hwnd).collect::<Vec<_>>(), o.headless)
     });
@@ -237,7 +266,9 @@ pub fn sim(cmd: &str) {
             }
             "drag" if parts.len() == 2 => {
                 s.cursor = (parts[0], parts[1]);
+                let starting = !s.dragging;
                 s.dragging = true;
+                apply_snap(s, starting);
             }
             "up" => {
                 o.on_up();
@@ -396,8 +427,12 @@ impl Overlay {
         let Some(s) = self.s.as_mut() else { return };
         s.cursor = crate::capture::cursor_pos();
         if let Some(d) = s.drag {
-            if (s.cursor.0 - d.0).abs() > 3 || (s.cursor.1 - d.1).abs() > 3 {
+            let starting = !s.dragging && ((s.cursor.0 - d.0).abs() > 3 || (s.cursor.1 - d.1).abs() > 3);
+            if starting {
                 s.dragging = true;
+            }
+            if s.dragging {
+                apply_snap(s, starting);
             }
         }
         self.update_hover();

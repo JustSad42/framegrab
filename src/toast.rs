@@ -20,6 +20,7 @@ pub enum Action {
     Delete = 5,
     Close = 6,
     Upload = 7,
+    Pin = 8,
 }
 
 impl Action {
@@ -32,6 +33,7 @@ impl Action {
             5 => Action::Delete,
             6 => Action::Close,
             7 => Action::Upload,
+            8 => Action::Pin,
             _ => return None,
         })
     }
@@ -119,7 +121,9 @@ pub fn show(host: HWND, content: Content, path: Option<PathBuf>, seconds: u32) {
     let Some(m) = mons.iter().find(|m| m.rect.contains(cx, cy)).or_else(|| mons.iter().find(|m| m.primary)).or(mons.first()).cloned() else { return };
     let s = m.scale();
     let wide_card = matches!(&content, Content::Image { upload: true, .. });
-    let cw = ((if wide_card { 384.0 } else { 340.0 }) * s) as i32;
+    // Image cards also have Pin (and Upload when that's set up).
+    let base = if matches!(&content, Content::Image { .. }) { 386.0 } else { 340.0 };
+    let cw = ((if wide_card { base + 46.0 } else { base }) * s) as i32;
     let pad = (12.0 * s) as i32;
     let body_h = match &content {
         Content::Image { thumb, .. } => {
@@ -204,8 +208,8 @@ fn layout(t: &Toast) -> Vec<(Action, Rect)> {
     let gap = (6.0 * s) as i32;
     let mut out = Vec::new();
     let acts: &[Action] = match t.content {
-        Content::Image { upload: true, .. } => &[Action::Edit, Action::Text, Action::Copy, Action::Upload, Action::Folder, Action::Delete],
-        Content::Image { .. } => &[Action::Edit, Action::Text, Action::Copy, Action::Folder, Action::Delete],
+        Content::Image { upload: true, .. } => &[Action::Edit, Action::Text, Action::Copy, Action::Pin, Action::Upload, Action::Folder, Action::Delete],
+        Content::Image { .. } => &[Action::Edit, Action::Text, Action::Copy, Action::Pin, Action::Folder, Action::Delete],
         Content::Text { .. } => &[Action::Copy],
         Content::Video { .. } => &[Action::Folder, Action::Delete],
     };
@@ -282,6 +286,7 @@ fn paint(t: &mut Toast) {
             Action::Folder => (icon::FOLDER_OPEN, if matches!(t.content, Content::Video { .. }) { "Show in folder" } else { "" }),
             Action::Delete => (icon::TRASH, ""),
             Action::Upload => (icon::UPLOAD, ""),
+            Action::Pin => (icon::PIN, ""),
             Action::Close => (icon::X, ""),
         };
         if *a == Action::Close {

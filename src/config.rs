@@ -250,6 +250,10 @@ pub struct Config {
     pub upload: Upload,
     /// When the grabbed text is just a link, code or email address, copy only that.
     pub smart_copy: bool,
+    /// Selection edges stick to edges in the screenshot (hold Alt to drag freely).
+    pub snap_edges: bool,
+    /// Editor arrow tips land on the nearest edge (hold Alt to place freely).
+    pub smart_arrows: bool,
     pub translate: Translate,
 }
 
@@ -297,6 +301,8 @@ impl Default for Config {
             beautify_shadow: true,
             upload: Upload::default(),
             smart_copy: true,
+            snap_edges: true,
+            smart_arrows: true,
             translate: Translate::default(),
         }
     }

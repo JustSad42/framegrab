@@ -29,6 +29,8 @@ pub mod col {
 pub const ICON_FONT: &[u8] = include_bytes!("../assets/phosphor-min.ttf");
 
 pub mod icon {
+    pub const PIN: &str = "\u{E3E2}";
+    pub const HISTORY: &str = "\u{E1A0}";
     pub const SELECTION: &str = "\u{E626}";
     pub const MONITOR: &str = "\u{E32E}";
     pub const TEXT_T: &str = "\u{E6EE}";

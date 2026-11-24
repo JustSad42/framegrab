@@ -18,9 +18,14 @@ struct Settings {
     /// Which hotkey row is waiting for a key combination.
     recording: Option<usize>,
     page: usize,
+    history: Vec<crate::history::Entry>,
+    thumbs: std::collections::HashMap<u64, egui::TextureHandle>,
+    history_loaded: f64,
+    history_status: Option<(String, f64)>,
 }
 
-const PAGES: [(&str, &str); 8] = [
+const PAGES: [(&str, &str); 9] = [
+    ("\u{E1A0}", "History"),
     ("\u{E2D8}", "Shortcuts"),
     ("\u{E626}", "Capture"),
     ("\u{E6A2}", "Windows & beautify"),
@@ -46,7 +51,7 @@ pub fn run() {
             ui::install(&cc.egui_ctx);
             let cfg = Config::load();
             let paused = std::fs::read_to_string(crate::config::data_dir().join("status")).is_ok_and(|s| s.trim() == "paused");
-            Ok(Box::new(Settings { saved: cfg.clone(), cfg, langs: crate::ocr::languages(), snip_key: snip_key_setting(), update: None, frames: 0, paused, recording: None, page: 0 }))
+            Ok(Box::new(Settings { saved: cfg.clone(), cfg, langs: crate::ocr::languages(), snip_key: snip_key_setting(), update: None, frames: 0, paused, recording: None, page: 0, history: Vec::new(), thumbs: Default::default(), history_loaded: -10.0, history_status: None }))
         }),
     );
     recorder::stop();
@@ -298,7 +303,147 @@ fn hotkey_mut(h: &mut Hotkeys, i: usize) -> &mut Hotkey {
 
 const TOKENS: [(&str, &str); 7] = [("{date}", "2026-11-24"), ("{time}", "153012"), ("{app}", "app name"), ("{title}", "window title"), ("{mode}", "Snip, Window…"), ("{w}", "width"), ("{h}", "height")];
 
+fn small_icon(ui: &mut egui::Ui, icon: &str, tip: &str) -> egui::Response {
+    let (r, resp) = ui.allocate_exact_size(egui::vec2(28.0, 26.0), egui::Sense::click());
+    if resp.hovered() {
+        ui.painter().rect_filled(r, CornerRadius::same(6), Color32::from_white_alpha(14));
+    }
+    ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, icon, ui::icon_font(15.0), if resp.hovered() { TEXT } else { MUTED });
+    resp.on_hover_text(tip)
+}
+
 impl Settings {
+    fn history_page(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let now = ctx.input(|i| i.time);
+        if now - self.history_loaded > 1.5 {
+            let fresh = crate::history::load();
+            if fresh != self.history {
+                self.thumbs.retain(|id, _| fresh.iter().any(|e| e.id == *id));
+                self.history = fresh;
+            }
+            self.history_loaded = now;
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(1500));
+        ui.label(RichText::new(format!("The last {} captures, kept even when saving is off. Click to copy, drag one out to share it.", crate::history::MAX)).color(MUTED));
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if !self.history.is_empty() && ui.button("Clear history").clicked() {
+                    crate::app::send_to_running("history-clear");
+                    self.history.clear();
+                    self.thumbs.clear();
+                }
+                if ui.button("Close all pins").clicked() {
+                    crate::app::send_to_running("pins-close");
+                }
+            });
+        });
+        if let Some((msg, t)) = &self.history_status {
+            if now - t < 2.5 {
+                ui.label(RichText::new(format!("\u{E182}  {msg}")).small().color(Color32::from_rgb(0x5B, 0xD6, 0x8A)));
+            }
+        }
+        ui.add_space(8.0);
+        if self.history.is_empty() {
+            ui.add_space(40.0);
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new("Nothing here yet").font(ui::bold(15.0)).color(TEXT));
+                ui.label(RichText::new("Captures show up here as you take them.").color(FAINT));
+            });
+            return;
+        }
+        let tile = 196.0;
+        let mut action: Option<(u64, &str)> = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
+            for e in &self.history {
+                let tex = self.thumbs.entry(e.id).or_insert_with(|| {
+                    let img = crate::output::read_png(std::path::Path::new(&e.thumb)).unwrap_or_else(|_| crate::capture::Image::new(1, 1));
+                    ctx.load_texture(format!("h{}", e.id), egui::ColorImage::from_rgba_unmultiplied([img.w as usize, img.h as usize], &img.to_rgba()), egui::TextureOptions::LINEAR)
+                });
+                egui::Frame::new().fill(CARD).stroke(Stroke::new(1.0, BORDER)).corner_radius(CornerRadius::same(10)).inner_margin(egui::Margin::same(8)).show(ui, |ui| ui.vertical(|ui| {
+                    // Fixed-width column (the wrapped row around it would otherwise lay the tile out sideways).
+                    ui.set_width(tile);
+                    let ts = tex.size_vec2();
+                    let k = (tile / ts.x).min(116.0 / ts.y);
+                    let (r, resp) = ui.allocate_exact_size(egui::vec2(tile, 116.0), egui::Sense::click_and_drag());
+                    ui.painter().rect_filled(r, CornerRadius::same(6), Color32::from_rgb(0x10, 0x10, 0x13));
+                    ui.painter().image(tex.id(), egui::Rect::from_center_size(r.center(), ts * k), egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                    let resp = resp.on_hover_text("Click to copy · drag into Discord, a browser or Explorer").on_hover_cursor(egui::CursorIcon::Grab);
+                    if resp.drag_started() {
+                        action = Some((e.id, "drag"));
+                    } else if resp.clicked() {
+                        action = Some((e.id, "copy"));
+                    }
+                    ui.horizontal(|ui| {
+                        let time = e.time.get(11..).map(|t| format!("{}:{}", &t[..2], &t[2..4])).unwrap_or_default();
+                        let day = e.time.get(..10).unwrap_or("");
+                        ui.label(RichText::new(format!("{day} {time}")).small().color(MUTED));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(RichText::new(format!("{}×{}", e.w, e.h)).small().color(FAINT));
+                        });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        if small_icon(ui, "\u{E1CA}", "Copy").clicked() {
+                            action = Some((e.id, "copy"));
+                        }
+                        if small_icon(ui, "\u{E3E2}", "Pin to screen").clicked() {
+                            action = Some((e.id, "pin"));
+                        }
+                        if small_icon(ui, "\u{E3B4}", "Edit").clicked() {
+                            action = Some((e.id, "edit"));
+                        }
+                        if small_icon(ui, "\u{E256}", "Show in folder").clicked() {
+                            action = Some((e.id, "folder"));
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if small_icon(ui, "\u{E4A6}", "Remove from history (a saved file stays)").clicked() {
+                                action = Some((e.id, "remove"));
+                            }
+                        });
+                    });
+                }));
+            }
+        });
+        let Some((id, what)) = action else { return };
+        let Some(e) = self.history.iter().find(|e| e.id == id).cloned() else { return };
+        let img_path = std::path::PathBuf::from(&e.image);
+        let shown = e.saved.clone().map(std::path::PathBuf::from).filter(|p| p.exists()).unwrap_or(img_path.clone());
+        match what {
+            "copy" => {
+                if let Ok(img) = crate::output::read_png(&img_path) {
+                    crate::output::copy_image(&img);
+                    self.history_status = Some(("Copied".into(), now));
+                }
+            }
+            "drag" => {
+                crate::dragout::drag_file(&shown);
+            }
+            "pin" => {
+                crate::app::send_to_running(&format!("pin {id}"));
+            }
+            "edit" => {
+                let saved_png = e.saved.as_ref().is_some_and(|p| p.to_lowercase().ends_with(".png") && std::path::Path::new(p).exists());
+                match &e.saved {
+                    Some(sp) if saved_png => crate::app::spawn_self(&["--edit", sp]),
+                    Some(sp) if std::path::Path::new(sp).exists() => crate::app::spawn_self(&["--edit", &e.image, "--out", sp]),
+                    _ => crate::app::spawn_self(&["--edit", &e.image]),
+                }
+            }
+            "folder" => {
+                let _ = std::process::Command::new("explorer").arg(format!("/select,{}", shown.display())).spawn();
+            }
+            "remove" => {
+                crate::app::send_to_running(&format!("history-remove {id}"));
+                self.history.retain(|x| x.id != id);
+                self.thumbs.remove(&id);
+            }
+            _ => {}
+        }
+    }
+
     fn shortcuts(&mut self, ui: &mut egui::Ui) {
         // Pick up a finished recording.
         if let Some(i) = self.recording {
@@ -609,16 +754,19 @@ impl eframe::App for Settings {
                 ui.label(RichText::new(title).heading());
                 ui.add_space(10.0);
                 match self.page {
-                    0 => card(ui, "", |ui| self.shortcuts(ui)),
-                    1 => card(ui, "After a capture", |ui| self.after_capture(ui)),
-                    2 => card(ui, "Windows & beautify", |ui| self.windows_and_beautify(ui)),
-                    3 => card(ui, "While selecting", |ui| {
+                    0 => self.history_page(ui),
+                    1 => card(ui, "", |ui| self.shortcuts(ui)),
+                    2 => card(ui, "After a capture", |ui| self.after_capture(ui)),
+                    3 => card(ui, "Windows & beautify", |ui| self.windows_and_beautify(ui)),
+                    4 => card(ui, "While selecting", |ui| {
                         let c = &mut self.cfg;
                         toggle(ui, &mut c.magnifier, "Always show the magnifier", "Pixel zoom and colour picker next to the cursor. When off, press C while snipping to show it.");
                         toggle(ui, &mut c.crosshair, "Crosshair", "Faint guide lines through the cursor");
+                        toggle(ui, &mut c.snap_edges, "Snap to edges", "Selection edges stick to the borders of panels, buttons and images. Hold Alt to drag freely.");
+                        toggle(ui, &mut c.smart_arrows, "Smart arrows in the editor", "Arrow tips land on the edge they point at. Hold Alt to place them freely.");
                         toggle(ui, &mut c.capture_cursor, "Include the mouse pointer in screenshots", "");
                     }),
-                    4 => card(ui, "", |ui| {
+                    5 => card(ui, "", |ui| {
                         let c = &mut self.cfg;
                         row(ui, "Format", |ui| segmented(ui, &mut c.rec_format, &[(RecFormat::Mp4, "MP4"), (RecFormat::Gif, "GIF")]));
                         if c.rec_format == RecFormat::Mp4 {
@@ -634,8 +782,8 @@ impl eframe::App for Settings {
                         let d = Config { rec_dir: String::new(), ..c.clone() }.recordings_dir();
                         folder_row(ui, "Recordings folder", &mut c.rec_dir, d);
                     }),
-                    5 => card(ui, "", |ui| self.text_grab(ui)),
-                    6 => card(ui, "", |ui| self.uploads(ui)),
+                    6 => card(ui, "", |ui| self.text_grab(ui)),
+                    7 => card(ui, "", |ui| self.uploads(ui)),
                     _ => card(ui, "", |ui| {
                         let c = &mut self.cfg;
                         toggle(ui, &mut c.start_with_windows, "Start with Windows", "Runs quietly in the background, no tray icon");

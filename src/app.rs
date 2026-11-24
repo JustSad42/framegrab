@@ -84,6 +84,8 @@ struct App {
     jobs_rx: Receiver<Job>,
     /// Last capture shown in the toolbar (for Copy / Text / Edit without re-reading the file).
     last: Option<(Image, Option<PathBuf>)>,
+    /// Where the last capture was on screen (a pin appears right there).
+    last_rect: Option<Rect>,
 }
 
 thread_local! {
@@ -152,7 +154,7 @@ pub fn run(background: bool) {
     }
     let cfg = Config::load();
     let (jobs_tx, jobs_rx) = channel();
-    APP.with(|a| *a.borrow_mut() = Some(App { host, cfg: cfg.clone(), busy: Busy::Idle, jobs_tx, jobs_rx, last: None }));
+    APP.with(|a| *a.borrow_mut() = Some(App { host, cfg: cfg.clone(), busy: Busy::Idle, jobs_tx, jobs_rx, last: None, last_rect: None }));
     apply_config(&cfg);
     write_status();
     if !config::test_mode() || std::env::var_os("FRAMEGRAB_HOOK").is_some() {
@@ -407,7 +409,12 @@ fn jobs_tx() -> Option<JobTx> {
 /// format, upload) comes from Settings and runs on a worker thread, so nothing waits on the user.
 fn deliver(img: Image, meta: Meta) {
     schedule_trim();
-    let Some((cfg, host)) = with(|a| (a.cfg.clone(), a.host)) else { return };
+    let Some((cfg, host)) = with(|a| {
+        a.last_rect = meta.rect;
+        (a.cfg.clone(), a.host)
+    }) else {
+        return;
+    };
     if cfg.sound {
         crate::feedback::sound();
     }
@@ -478,6 +485,7 @@ fn deliver(img: Image, meta: Meta) {
                 Err(e) => log(&format!("save failed: {e}")),
             }
         }
+        let saved = bytes.is_some();
         if cfg.upload.provider != config::UploadProvider::Off && cfg.upload.auto {
             let b = bytes.or_else(|| output::encode(&fin, cfg.format, cfg.quality).ok());
             if let (Some(b), Some(tx)) = (b, &tx) {
@@ -485,6 +493,7 @@ fn deliver(img: Image, meta: Meta) {
                 tx.send(Job::Uploaded(crate::upload::upload(&cfg.upload, &b, &name, ext)));
             }
         }
+        crate::history::add(&fin, path.as_deref().filter(|_| saved));
     });
     let _ = host;
 }
@@ -580,6 +589,13 @@ fn toast_action(a: Action) {
                 output::copy_image(&img);
             }
             toast::dismiss();
+        }
+        Action::Pin => {
+            if let Some((img, _)) = with(|a| a.last.clone()).flatten() {
+                let at = with(|a| a.last_rect).flatten();
+                toast::dismiss();
+                crate::pin::pin(img, at);
+            }
         }
         Action::Folder => {
             if let Some(p) = toast::path() {
@@ -950,6 +966,27 @@ fn copydata(s: &str) {
             with(|a| a.cfg = cfg);
         }
         "quit" => quit(),
+        "pin" => {
+            // pin <history id>
+            let img = rest.parse::<u64>().ok().and_then(crate::history::find).and_then(|e| output::read_png(std::path::Path::new(&e.image)).ok());
+            if let Some(img) = img {
+                crate::pin::pin(img, None);
+            }
+        }
+        "history-remove" => {
+            if let Ok(id) = rest.parse::<u64>() {
+                crate::history::remove(id);
+            }
+        }
+        "history-clear" => crate::history::clear(),
+        "pins-close" => crate::pin::close_all(),
+        "pin-dump" => {
+            // pin-dump <dir> [zoom factor]
+            let (dir, f) = rest.rsplit_once(' ').and_then(|(d, f)| f.parse::<f32>().ok().map(|f| (d, f))).unwrap_or((rest, 1.0));
+            let r = crate::pin::dump(std::path::Path::new(dir), f);
+            let _ = std::fs::write(std::path::Path::new(dir).join("pins.txt"), r);
+        }
+        "pin-last" => toast_action(Action::Pin),
         "pause" => {
             hook::PAUSED.store(rest != "off", Relaxed);
             write_status();
@@ -963,7 +1000,11 @@ fn copydata(s: &str) {
         "gfx-selftest" => {
             // Draws through the real window path (shared GPU device + swap chain) in a window
             // parked far off-screen, then reads it back with PrintWindow.
-            let h = win::create(host_class(), "fg-selftest", WS_POPUP, WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, -20000, -20000, 320, 160, None);
+            unsafe extern "system" fn plain(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+                unsafe { DefWindowProcW(h, m, w, l) }
+            }
+            win::register_class("FramegrabSelftest", Some(plain));
+            let h = win::create("FramegrabSelftest", "fg-selftest", WS_POPUP, WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, -20000, -20000, 320, 160, None);
             unsafe {
                 let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
             }

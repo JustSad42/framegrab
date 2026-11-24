@@ -842,6 +842,16 @@ impl Editor {
                 self.pick(p);
             }
             if let Some(p) = pp {
+                // Smart arrows: the tip lands on the nearest edge (a button or panel border).
+                let alt = resp.ctx.input(|i| i.modifiers.alt);
+                let arrow = self.drawing.as_ref().is_some_and(|d| matches!(d.kind, Kind::Arrow | Kind::Curve));
+                let tip = if arrow && self.cfg.smart_arrows && !alt && !shift {
+                    let r = (10.0 / self.zoom.max(0.25)).clamp(4.0, 24.0) as i32;
+                    let base = &self.base;
+                    crate::snap::snap_tip(&|x, y| crate::snap::luma(base, x, y), (p.x.round() as i32, p.y.round() as i32), r).map(|(x, y)| pos2(x as f32 + 0.5, y as f32 + 0.5))
+                } else {
+                    None
+                };
                 if let (Some(last), Some(i)) = (self.moving, self.selected) {
                     let d = p - last;
                     if let Some(s) = self.shapes.get_mut(i) {
@@ -878,6 +888,7 @@ impl Editor {
                             let m = d.x.abs().max(d.y.abs());
                             s.b = s.a + vec2(m * d.x.signum(), m * d.y.signum());
                         }
+                        Kind::Arrow | Kind::Curve if tip.is_some() => s.b = tip.unwrap_or(p),
                         _ => s.b = p,
                     }
                 }
@@ -1189,7 +1200,7 @@ impl eframe::App for Editor {
                     }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(egui::RichText::new("Wheel to zoom · Space+drag to pan · 0 to fit · Shift for straight lines / squares · F beautify").small().color(FAINT));
+                    ui.label(egui::RichText::new("Wheel to zoom · Space+drag to pan · 0 to fit · Shift for straight lines / squares · Alt to place arrows freely · F beautify").small().color(FAINT));
                 });
             });
         });
