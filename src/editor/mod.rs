@@ -487,7 +487,7 @@ impl Editor {
             while x < self.base.w {
                 let tw = t.min(self.base.w - x);
                 let part = self.base.crop(x as i32, y as i32, tw as i32, th as i32);
-                let ci = egui::ColorImage::from_rgba_unmultiplied([tw as usize, th as usize], &part.to_rgba());
+                let ci = ui::color_image(&part);
                 let tex = ctx.load_texture(format!("tile{x}_{y}"), ci, opts);
                 self.tiles.push((Rect::from_min_size(pos2(x as f32, y as f32), vec2(tw as f32, th as f32)), tex));
                 x += t;
@@ -513,7 +513,7 @@ impl Editor {
         let mut tmp = self.base.crop(key[0].min(x0), key[1].min(y0), x1 - x0, y1 - y0);
         let (tw, th) = (tmp.w as i32, tmp.h as i32);
         render::pixelate(&mut tmp, 0, 0, tw, th);
-        let ci = egui::ColorImage::from_rgba_unmultiplied([tmp.w as usize, tmp.h as usize], &tmp.to_rgba());
+        let ci = ui::color_image(&tmp);
         let tex = ctx.load_texture(format!("blur{}", s.id), ci, egui::TextureOptions::NEAREST);
         let id = tex.id();
         self.blur_tex.insert(s.id, (key, tex));

@@ -13,6 +13,12 @@ pub const MUTED: Color32 = Color32::from_rgb(0xa3, 0xa3, 0xae);
 pub const FAINT: Color32 = Color32::from_rgb(0x6e, 0x6e, 0x7a);
 pub const ACCENT: Color32 = Color32::from_rgb(0x6e, 0x8b, 0xff);
 
+/// A texture image from a BGRA capture in one pass.
+pub fn color_image(img: &crate::capture::Image) -> egui::ColorImage {
+    let px = img.px.chunks_exact(4).map(|p| if p[3] == 255 { Color32::from_rgb(p[2], p[1], p[0]) } else { Color32::from_rgba_unmultiplied(p[2], p[1], p[0], p[3]) }).collect();
+    egui::ColorImage::new([img.w as usize, img.h as usize], px)
+}
+
 pub fn icon_font(size: f32) -> FontId {
     FontId::new(size, FontFamily::Name("icons".into()))
 }

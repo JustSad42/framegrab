@@ -31,7 +31,6 @@ pub const ICON_FONT: &[u8] = include_bytes!("../assets/phosphor-min.ttf");
 pub mod icon {
     pub const SCISSORS: &str = "\u{EAE0}";
     pub const PIN: &str = "\u{E3E2}";
-    pub const HISTORY: &str = "\u{E1A0}";
     pub const SELECTION: &str = "\u{E626}";
     pub const MONITOR: &str = "\u{E32E}";
     pub const TEXT_T: &str = "\u{E6EE}";
@@ -50,9 +49,6 @@ pub mod icon {
     pub const SPEAKER: &str = "\u{E44A}";
     pub const SPEAKER_X: &str = "\u{E45C}";
     pub const CHECK: &str = "\u{E182}";
-    pub const FILM: &str = "\u{E792}";
-    pub const GIF: &str = "\u{EA82}";
-    pub const APP_WINDOW: &str = "\u{E5DA}";
     pub const UPLOAD: &str = "\u{E4C0}";
 }
 
@@ -361,11 +357,6 @@ impl Canvas {
         unsafe { self.rt.FillRoundedRectangle(&rr, self.b(c)) }
     }
 
-    pub fn round_stroke(&self, x: f32, y: f32, w: f32, h: f32, r: f32, c: u32, width: f32) {
-        let rr = D2D1_ROUNDED_RECT { rect: rf(x, y, w, h), radiusX: r, radiusY: r };
-        unsafe { self.rt.DrawRoundedRectangle(&rr, self.b(c), width, None) }
-    }
-
     pub fn stroke(&self, x: f32, y: f32, w: f32, h: f32, c: u32, width: f32) {
         unsafe { self.rt.DrawRectangle(&rf(x, y, w, h), self.b(c), width, None) }
     }
@@ -378,11 +369,6 @@ impl Canvas {
     pub fn circle(&self, cx: f32, cy: f32, r: f32, c: u32) {
         let e = D2D1_ELLIPSE { point: Vector2 { X: cx, Y: cy }, radiusX: r, radiusY: r };
         unsafe { self.rt.FillEllipse(&e, self.b(c)) }
-    }
-
-    pub fn circle_stroke(&self, cx: f32, cy: f32, r: f32, c: u32, width: f32) {
-        let e = D2D1_ELLIPSE { point: Vector2 { X: cx, Y: cy }, radiusX: r, radiusY: r };
-        unsafe { self.rt.DrawEllipse(&e, self.b(c), width, None) }
     }
 
     pub fn text(&self, s: &str, x: f32, y: f32, w: f32, h: f32, size: f32, weight: u32, c: u32, align: Align) {
@@ -421,14 +407,6 @@ impl Canvas {
     pub fn draw_bitmap(&self, bmp: &ID2D1Bitmap, dst: D2D_RECT_F, src: D2D_RECT_F, opacity: f32, nearest: bool) {
         let mode = if nearest { D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR } else { D2D1_BITMAP_INTERPOLATION_MODE_LINEAR };
         unsafe { self.rt.DrawBitmap(bmp, Some(&dst), opacity, mode, Some(&src)) }
-    }
-
-    pub fn clip(&self, x: f32, y: f32, w: f32, h: f32) {
-        unsafe { self.rt.PushAxisAlignedClip(&rf(x, y, w, h), D2D1_ANTIALIAS_MODE_ALIASED) }
-    }
-
-    pub fn unclip(&self) {
-        unsafe { self.rt.PopAxisAlignedClip() }
     }
 
     /// Clips to a rounded rectangle via a layer; pair with `pop_layer`.

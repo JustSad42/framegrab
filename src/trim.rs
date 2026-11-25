@@ -207,30 +207,45 @@ pub fn remux(src: &Path, dst: &Path, start: i64, end: i64) -> Result<(), String>
 enum Cmd {
     Seek(i64),
     Play(i64, i64),
-    Stop,
 }
 
 enum Msg {
-    Frame(i64, Image),
+    /// Frame time, picture, and whether it's full size (playback sends smaller ones).
+    Frame(i64, Image, bool),
     Ended,
     Error(String),
 }
 
-fn frame_of(s: &IMFSample, w: u32, h: u32, stride: i32) -> windows_core::Result<Image> {
+/// Playback frames are at most this wide (a 4K frame is 33 MB; the window shows far less).
+const PLAY_MAX_W: u32 = 1600;
+
+/// Copies a decoded frame out, keeping every `step`-th pixel (1 = full size).
+fn frame_of(s: &IMFSample, w: u32, h: u32, stride: i32, step: u32) -> windows_core::Result<Image> {
     unsafe {
         let buf = s.ConvertToContiguousBuffer()?;
         let (mut p, mut len) = (std::ptr::null_mut(), 0u32);
         buf.Lock(&mut p, None, Some(&mut len))?;
         let data = std::slice::from_raw_parts(p, len as usize);
-        let mut img = Image::new(w, h);
-        let row = (w * 4) as usize;
+        let step = step.max(1);
+        let (ow, oh) = (w.div_ceil(step), h.div_ceil(step));
+        let mut img = Image::new(ow, oh);
         let st = stride.unsigned_abs() as usize;
-        for y in 0..h as usize {
+        for y in 0..oh as usize {
+            let srcy = y * step as usize;
             // A negative stride means the rows are stored bottom-up.
-            let sy = if stride < 0 { h as usize - 1 - y } else { y };
+            let sy = if stride < 0 { h as usize - 1 - srcy } else { srcy };
             let o = sy * st;
-            if o + row <= data.len() {
-                img.px[y * row..(y + 1) * row].copy_from_slice(&data[o..o + row]);
+            if o + (w * 4) as usize > data.len() {
+                continue;
+            }
+            let dst = &mut img.px[y * (ow * 4) as usize..(y + 1) * (ow * 4) as usize];
+            if step == 1 {
+                dst.copy_from_slice(&data[o..o + (w * 4) as usize]);
+            } else {
+                for (x, d) in dst.chunks_exact_mut(4).enumerate() {
+                    let i = o + x * step as usize * 4;
+                    d.copy_from_slice(&data[i..i + 4]);
+                }
             }
         }
         buf.Unlock()?;
@@ -297,7 +312,6 @@ fn decoder(path: PathBuf, rx: Receiver<Cmd>, tx: Sender<Msg>, ctx: egui::Context
             cmd = c;
         }
         match cmd {
-            Cmd::Stop => {}
             Cmd::Seek(t) => {
                 seek(t);
                 let mut last: Option<(i64, IMFSample)> = None;
@@ -310,8 +324,8 @@ fn decoder(path: PathBuf, rx: Receiver<Cmd>, tx: Sender<Msg>, ctx: egui::Context
                     }
                 }
                 if let Some((ts, s)) = last {
-                    if let Ok(img) = frame_of(&s, w, h, stride) {
-                        send(Msg::Frame(ts, img));
+                    if let Ok(img) = frame_of(&s, w, h, stride, 1) {
+                        send(Msg::Frame(ts, img, true));
                     }
                 }
             }
@@ -342,8 +356,8 @@ fn decoder(path: PathBuf, rx: Receiver<Cmd>, tx: Sender<Msg>, ctx: egui::Context
                     } else if now - due > Duration::from_millis(100) {
                         continue; // Behind: skip converting this frame.
                     }
-                    if let Ok(img) = frame_of(&s, w, h, stride) {
-                        send(Msg::Frame(ts, img));
+                    if let Ok(img) = frame_of(&s, w, h, stride, w.div_ceil(PLAY_MAX_W)) {
+                        send(Msg::Frame(ts, img, false));
                     }
                 }
             }
@@ -386,6 +400,10 @@ struct Trim {
     text: Option<String>,
     save_rx: Option<Receiver<(Result<(), String>, bool, PathBuf)>>,
     demo: Option<(PathBuf, u32)>,
+    /// Whether `frame` is full size (playback frames are smaller).
+    frame_full: bool,
+    /// Size of the last playback frame (test hook report).
+    played: Option<(u32, u32)>,
 }
 
 pub fn run(path: PathBuf) {
@@ -430,6 +448,8 @@ impl Trim {
             text: None,
             save_rx: None,
             demo: std::env::var_os("FRAMEGRAB_TRIM_DEMO").map(|d| (PathBuf::from(d), 0)),
+            frame_full: false,
+            played: None,
         };
         t.open(ctx);
         t
@@ -486,8 +506,9 @@ impl Trim {
 
     fn toggle_play(&mut self) {
         if self.playing {
+            // Pausing shows the full-size frame (also what Read text reads).
             self.playing = false;
-            self.send(Cmd::Stop);
+            self.send(Cmd::Seek(self.head));
             return;
         }
         let from = if self.head >= self.end - self.frame_len() || self.head < self.start { self.start } else { self.head };
@@ -577,13 +598,21 @@ impl Trim {
             let mut latest = None;
             while let Ok(m) = rx.try_recv() {
                 match m {
-                    Msg::Frame(t, img) => latest = Some((t, img)),
-                    Msg::Ended => self.playing = false,
+                    Msg::Frame(t, img, full) => latest = Some((t, img, full)),
+                    Msg::Ended => {
+                        // Swap the small playback frame for a full-size one.
+                        self.playing = false;
+                        self.send(Cmd::Seek(self.head));
+                    }
                     Msg::Error(e) => self.error = Some(e),
                 }
             }
-            if let Some((t, img)) = latest {
-                let ci = egui::ColorImage::from_rgba_unmultiplied([img.w as usize, img.h as usize], &img.to_rgba());
+            if let Some((t, img, full)) = latest {
+                self.frame_full = full;
+                if !full {
+                    self.played = Some((img.w, img.h));
+                }
+                let ci = ui::color_image(&img);
                 match &mut self.tex {
                     Some(tex) => tex.set(ci, egui::TextureOptions::LINEAR),
                     None => self.tex = Some(ctx.load_texture("frame", ci, egui::TextureOptions::LINEAR)),
@@ -742,10 +771,16 @@ impl Trim {
             0 => {
                 self.start = self.snap_start(info.dur / 3);
                 self.end = info.dur * 2 / 3;
-                self.seek((self.start + self.end) / 2);
-                n += 1;
+                // Play a moment first (checks the smaller playback frames), then pause mid-range.
+                self.head = self.start;
+                self.toggle_play();
+                n = 10;
             }
-            1 if self.frame.as_ref().is_some_and(|(t, _)| (*t - self.head).abs() < SEC / 2) && self.drag.is_none() => {
+            10 if self.played.is_some() => {
+                self.seek((self.start + self.end) / 2);
+                n = 1;
+            }
+            1 if self.frame_full && self.frame.as_ref().is_some_and(|(t, _)| (*t - self.head).abs() < SEC / 2) && self.drag.is_none() => {
                 self.read_text(ctx, now);
                 n += 1;
             }
@@ -764,8 +799,10 @@ impl Trim {
                     let r = remux(&self.path, &out, self.start, self.end);
                     let probe_out = probe(&out);
                     let rep = format!(
-                        "source: {:?}\nrange: {} - {} (start keyframe {})\nremux: {:?}\ntrimmed: {:?}\nocr: {:?}\n",
+                        "source: {:?}\nplayback frame: {:?}, paused frame: {:?}\nrange: {} - {} (start keyframe {})\nremux: {:?}\ntrimmed: {:?}\nocr: {:?}\n",
                         DebugInfo(&info),
+                        self.played,
+                        self.frame.as_ref().map(|(_, i)| (i.w, i.h)),
                         fmt_time(self.start),
                         fmt_time(self.end),
                         info.keys.contains(&self.start),

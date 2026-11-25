@@ -224,7 +224,3 @@ pub fn grab_monitors(mons: &[crate::capture::Monitor]) -> Option<Vec<Image>> {
     Some(out)
 }
 
-/// Drops the cached D3D11 devices (they're recreated on the next capture, ~10 ms).
-pub fn release_devices() {
-    DEVICES.with(|d| d.borrow_mut().clear());
-}

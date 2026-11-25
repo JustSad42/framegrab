@@ -255,7 +255,7 @@ fn encode_mp4(rx: Receiver<Msg>, path: &std::path::Path, area: Rect, fps: u32, a
     let mut pending: Option<(Image, Duration)> = None;
     let frame = Duration::from_secs_f64(1.0 / fps as f64);
     let mut err = None;
-    let mut flush = |img: &Image, t: Duration, next: Option<Duration>, nv12: &mut Vec<u8>| {
+    let flush = |img: &Image, t: Duration, next: Option<Duration>, nv12: &mut Vec<u8>| {
         mp4::bgra_to_nv12(&img.px, img.w as usize, img.h as usize, nv12);
         let dur = next.map(|n| n.saturating_sub(t)).unwrap_or(frame).max(Duration::from_millis(1));
         mp4.video(nv12, (t.as_nanos() / 100) as i64, (dur.as_nanos() / 100) as i64)
@@ -283,7 +283,6 @@ fn encode_mp4(rx: Receiver<Msg>, path: &std::path::Path, area: Rect, fps: u32, a
     if let Some((p, pt)) = pending.take() {
         let _ = flush(&p, pt, None, &mut nv12);
     }
-    drop(flush);
     mp4.finish().map_err(|e| e.message())?;
     if let Some(e) = err {
         return Err(format!("Recording had errors: {e}"));
@@ -361,7 +360,6 @@ fn encode_gif(rx: Receiver<Msg>, path: &std::path::Path, area: Rect, fps: u32, r
     if let Some((p, _)) = prev.take() {
         send(p, (100 / fps) as u16, &mut idx);
     }
-    drop(send);
     drop(jtx);
     for p in pool {
         let _ = p.join();

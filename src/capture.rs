@@ -168,9 +168,6 @@ impl Rect {
         let y1 = self.bottom().min(o.bottom());
         (x1 > x0 && y1 > y0).then(|| Rect::new(x0, y0, x1 - x0, y1 - y0))
     }
-    pub fn area(&self) -> i64 {
-        self.w as i64 * self.h as i64
-    }
     pub fn is_empty(&self) -> bool {
         self.w <= 0 || self.h <= 0
     }

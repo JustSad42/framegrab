@@ -360,14 +360,20 @@ impl Settings {
             });
             return;
         }
-        let tile = 196.0;
+        // As many ~196 px columns as fit, stretched to fill the row exactly (inner margin 8 + border 1 each side).
+        let avail = ui.available_width() - 4.0;
+        let cols = ((avail + 12.0) / (196.0 + 18.0 + 12.0)).floor().max(1.0);
+        let tile = ((avail - (cols - 1.0) * 12.0) / cols - 18.0).floor();
         let mut action: Option<(u64, &str)> = None;
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(12.0, 12.0);
-            for e in &self.history {
+        // Explicit rows: egui's wrapping layout doesn't wrap framed cards reliably.
+        ui.spacing_mut().item_spacing.y = 12.0;
+        for row in self.history.chunks(cols as usize) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 12.0;
+            for e in row {
                 let tex = self.thumbs.entry(e.id).or_insert_with(|| {
                     let img = crate::output::read_png(std::path::Path::new(&e.thumb)).unwrap_or_else(|_| crate::capture::Image::new(1, 1));
-                    ctx.load_texture(format!("h{}", e.id), egui::ColorImage::from_rgba_unmultiplied([img.w as usize, img.h as usize], &img.to_rgba()), egui::TextureOptions::LINEAR)
+                    ctx.load_texture(format!("h{}", e.id), ui::color_image(&img), egui::TextureOptions::LINEAR)
                 });
                 egui::Frame::new().fill(CARD).stroke(Stroke::new(1.0, BORDER)).corner_radius(CornerRadius::same(10)).inner_margin(egui::Margin::same(8)).show(ui, |ui| ui.vertical(|ui| {
                     // Fixed-width column (the wrapped row around it would otherwise lay the tile out sideways).
@@ -414,6 +420,7 @@ impl Settings {
                 }));
             }
         });
+        }
         let Some((id, what)) = action else { return };
         let Some(e) = self.history.iter().find(|e| e.id == id).cloned() else { return };
         let img_path = std::path::PathBuf::from(&e.image);

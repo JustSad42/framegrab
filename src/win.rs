@@ -113,6 +113,3 @@ pub fn client_size(h: HWND) -> (u32, u32) {
     ((r.right - r.left).max(1) as u32, (r.bottom - r.top).max(1) as u32)
 }
 
-pub fn dpi_scale(h: HWND) -> f32 {
-    unsafe { windows::Win32::UI::HiDpi::GetDpiForWindow(h).max(96) as f32 / 96.0 }
-}
