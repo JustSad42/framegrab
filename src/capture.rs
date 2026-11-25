@@ -55,6 +55,33 @@ impl Image {
         }
     }
 
+    /// Bilinear resize to exactly `w`×`h` (used to upscale DPI-virtualized window grabs).
+    pub fn resize(&self, w: u32, h: u32) -> Image {
+        let mut out = Image::new(w.max(1), h.max(1));
+        if self.w == 0 || self.h == 0 {
+            return out;
+        }
+        let (sx, sy) = (self.w as f32 / out.w as f32, self.h as f32 / out.h as f32);
+        for y in 0..out.h {
+            let fy = ((y as f32 + 0.5) * sy - 0.5).clamp(0.0, (self.h - 1) as f32);
+            let (y0, ty) = (fy as u32, fy.fract());
+            let y1 = (y0 + 1).min(self.h - 1);
+            for x in 0..out.w {
+                let fx = ((x as f32 + 0.5) * sx - 0.5).clamp(0.0, (self.w - 1) as f32);
+                let (x0, tx) = (fx as u32, fx.fract());
+                let x1 = (x0 + 1).min(self.w - 1);
+                let p = |xx: u32, yy: u32, c: usize| self.px[((yy * self.w + xx) * 4) as usize + c] as f32;
+                let o = ((y * out.w + x) * 4) as usize;
+                for c in 0..4 {
+                    let top = p(x0, y0, c) * (1.0 - tx) + p(x1, y0, c) * tx;
+                    let bot = p(x0, y1, c) * (1.0 - tx) + p(x1, y1, c) * tx;
+                    out.px[o + c] = (top * (1.0 - ty) + bot * ty + 0.5) as u8;
+                }
+            }
+        }
+        out
+    }
+
     /// Area-averaged downscale to fit inside `mw`×`mh` (never upscales).
     pub fn fit(&self, mw: u32, mh: u32) -> Image {
         let s = (mw as f64 / self.w as f64).min(mh as f64 / self.h as f64).min(1.0);

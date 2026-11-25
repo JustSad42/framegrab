@@ -78,6 +78,24 @@ pub fn is_maximized(h: isize) -> bool {
     unsafe { IsZoomed(HWND(h as _)).as_bool() }
 }
 
+/// Windows stretches apps that aren't DPI-aware (many games, e.g. League of Legends) to the
+/// monitor's scale; PrintWindow then returns their small unstretched picture in one corner with
+/// the rest black. Returns that stretch factor (monitor DPI / window DPI) for such windows.
+pub fn dpi_stretch(hwnd: HWND) -> Option<f32> {
+    use windows::Win32::UI::HiDpi::*;
+    unsafe {
+        let aware = GetAwarenessFromDpiAwarenessContext(GetWindowDpiAwarenessContext(hwnd));
+        if aware == DPI_AWARENESS_PER_MONITOR_AWARE {
+            return None;
+        }
+        let wdpi = GetDpiForWindow(hwnd).max(96);
+        let hm = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let (mut dx, mut dy) = (96u32, 96u32);
+        GetDpiForMonitor(hm, MDT_EFFECTIVE_DPI, &mut dx, &mut dy).ok()?;
+        (dx != wdpi).then(|| dx as f32 / wdpi as f32)
+    }
+}
+
 /// Captures a window's own pixels (works when it's covered). `frame` is its visible bounds.
 pub fn print_window(h: isize, frame: Rect) -> Option<Image> {
     unsafe {
@@ -88,6 +106,18 @@ pub fn print_window(h: isize, frame: Rect) -> Option<Image> {
         if ww <= 0 || wh <= 0 || ww > 16384 || wh > 16384 {
             return None;
         }
+        // DPI-stretched window: when it's in front, the screen already has it at full resolution
+        // (sharper than upscaling its own small picture), so keep the screen pixels.
+        let stretch = dpi_stretch(hwnd);
+        if stretch.is_some() && GetForegroundWindow() == hwnd {
+            return None;
+        }
+        // Otherwise grab its own (smaller) picture and scale it up to the size on screen.
+        let (ww_full, wh_full) = (ww, wh);
+        let (ww, wh) = match stretch {
+            Some(k) => (((ww as f32 / k).round() as i32).max(1), ((wh as f32 / k).round() as i32).max(1)),
+            None => (ww, wh),
+        };
         let screen = GetDC(None);
         let mem = CreateCompatibleDC(Some(screen));
         let bmi = BITMAPINFO {
@@ -103,6 +133,9 @@ pub fn print_window(h: isize, frame: Rect) -> Option<Image> {
                 let _ = GdiFlush();
                 let mut full = Image::new(ww as u32, wh as u32);
                 std::ptr::copy_nonoverlapping(bits as *const u8, full.px.as_mut_ptr(), full.px.len());
+                if (ww, wh) != (ww_full, wh_full) {
+                    full = full.resize(ww_full as u32, wh_full as u32);
+                }
                 let img = full.crop(frame.x - wr.left, frame.y - wr.top, frame.w, frame.h);
                 // A fully black result means the app didn't draw for PrintWindow.
                 let lit = img.px.chunks_exact(4).step_by(97).any(|p| p[0] | p[1] | p[2] != 0);
@@ -160,5 +193,49 @@ mod tests {
         assert_eq!(img.px[3], 0);
         assert_eq!(img.px[((15 * 40 + 20) * 4 + 3) as usize], 255);
         assert_eq!(img.px[((29 * 40 + 39) * 4 + 3) as usize], 0);
+    }
+}
+
+#[cfg(test)]
+mod live {
+    /// FRAMEGRAB_DPI_TITLE=<window title> cargo test --release dpi_stretch_live -- --ignored --nocapture
+    /// Grabs a non-DPI-aware window (not in front) and checks the picture fills the whole frame.
+    #[test]
+    #[ignore]
+    fn dpi_stretch_live() {
+        use super::*;
+        use windows::Win32::UI::HiDpi::*;
+        unsafe {
+            let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        }
+        let title = std::env::var("FRAMEGRAB_DPI_TITLE").unwrap();
+        let w = windows_core::HSTRING::from(title.as_str());
+        let h = unsafe { FindWindowW(None, &w) }.expect("window");
+        let k = super::dpi_stretch(h);
+        let mut r = RECT::default();
+        unsafe { GetWindowRect(h, &mut r).unwrap() };
+        let frame = Rect::new(r.left, r.top, r.right - r.left, r.bottom - r.top);
+        let fg = unsafe { GetForegroundWindow() } == h;
+        println!("stretch {k:?} foreground {fg} frame {frame:?}");
+        let Some(img) = super::print_window(h.0 as isize, frame) else {
+            assert!(fg && k.is_some(), "no grab although not in front");
+            println!("in front: kept screen pixels (as intended)");
+            return;
+        };
+        // Fraction of non-black pixels in the bottom-right quarter (black there = the old bug).
+        let (mut lit, mut n) = (0, 0);
+        for y in img.h * 3 / 4..img.h {
+            for x in img.w * 3 / 4..img.w {
+                let i = ((y * img.w + x) * 4) as usize;
+                n += 1;
+                if img.px[i] as u32 + img.px[i + 1] as u32 + img.px[i + 2] as u32 > 30 {
+                    lit += 1;
+                }
+            }
+        }
+        println!("stretch {k:?}, {}x{}, bottom-right lit {:.0}%", img.w, img.h, lit as f32 * 100.0 / n as f32);
+        let _ = crate::output::write_png(&std::env::temp_dir().join("framegrab-dpi.png"), &img, true);
+        assert!(k.is_some(), "window should be DPI-stretched");
+        assert!(lit * 2 > n, "bottom-right should not be black");
     }
 }

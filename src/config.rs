@@ -47,6 +47,7 @@ pub enum UploadProvider {
     Off,
     Imgur,
     Custom,
+    ImgBB,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
@@ -58,6 +59,8 @@ pub struct Upload {
     /// After uploading, put the link on the clipboard (otherwise the image stays there).
     pub copy_link: bool,
     pub imgur_client_id: String,
+    /// imgbb.com API key (api.imgbb.com).
+    pub imgbb_key: String,
     pub custom_url: String,
     pub custom_field: String,
     pub custom_header: String,
@@ -72,6 +75,7 @@ impl Default for Upload {
             auto: false,
             copy_link: true,
             imgur_client_id: String::new(),
+            imgbb_key: String::new(),
             custom_url: String::new(),
             custom_field: "file".into(),
             custom_header: String::new(),

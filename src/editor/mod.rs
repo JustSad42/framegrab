@@ -148,6 +148,7 @@ struct Editor {
     demo: Option<(PathBuf, u32)>,
     /// Smart redaction running in the background (OCR of the base image).
     redacting: Option<std::sync::mpsc::Receiver<Result<Vec<(f32, f32, f32, f32, crate::ocr::Secret)>, String>>>,
+    uploading: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
 }
 
 pub fn run(path: PathBuf, out: Option<PathBuf>) {
@@ -224,6 +225,7 @@ impl Editor {
             closing: false,
             demo: std::env::var_os("FRAMEGRAB_EDITOR_DEMO").map(|d| (PathBuf::from(d), 0)),
             redacting: None,
+            uploading: None,
         }
     }
 
@@ -361,6 +363,51 @@ impl Editor {
 
     fn write(&self, path: &std::path::Path, img: &Image) -> Result<(), String> {
         crate::output::write_image(path, img, format_of(path), self.cfg.quality).map(|_| ())
+    }
+
+    /// Uploads what's on the canvas (with your edits) and copies the link.
+    fn upload_image(&mut self, ctx: &egui::Context, now: f64) {
+        if self.uploading.is_some() {
+            return;
+        }
+        let cfg = crate::config::Config::load();
+        if cfg.upload.provider == crate::config::UploadProvider::Off {
+            crate::app::spawn_self(&["--settings", "--page", "uploads"]);
+            self.status = Some(("Choose where to upload in Settings, then press Upload again".into(), now));
+            return;
+        }
+        self.finish_edit();
+        let img = self.export();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        let name = self.out.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "screenshot".into());
+        std::thread::spawn(move || {
+            let ext = cfg.format.ext();
+            let r = crate::output::encode(&img, cfg.format, cfg.quality).and_then(|b| crate::upload::upload(&cfg.upload, &b, &format!("{name}.{ext}"), ext));
+            if let Ok(url) = &r {
+                if cfg.upload.copy_link {
+                    crate::output::copy_text(url);
+                }
+            }
+            let _ = tx.send(r);
+            ctx.request_repaint();
+        });
+        self.uploading = Some(rx);
+        self.status = Some(("Uploading…".into(), now));
+    }
+
+    fn poll_upload(&mut self, now: f64) {
+        let Some(rx) = &self.uploading else { return };
+        let Ok(r) = rx.try_recv() else { return };
+        self.uploading = None;
+        self.status = Some((
+            match r {
+                Ok(url) if self.cfg.upload.copy_link || crate::config::Config::load().upload.copy_link => format!("Uploaded — link copied: {url}"),
+                Ok(url) => format!("Uploaded: {url}"),
+                Err(e) => e,
+            },
+            now,
+        ));
     }
 
     fn copy(&mut self, now: f64) {
@@ -561,11 +608,21 @@ impl Editor {
                     self.closing = true;
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
-                if text_button(ui, "\u{E248}", "Save").on_hover_text("Save over the capture and copy  (Ctrl+S)\nRight-click: Save as…").clicked() {
+                let save = icon_button(ui, "\u{E248}", false, "Save over the capture and copy  (Ctrl+S)\nRight-click: Save as…  (Ctrl+Shift+S)");
+                if save.clicked() {
                     self.save(now);
                 }
-                if text_button(ui, "\u{E1CA}", "Copy").on_hover_text("Copy to clipboard  (Ctrl+C)").clicked() {
+                if save.secondary_clicked() {
+                    self.save_as(now);
+                }
+                // Icon-only so the whole toolbar fits at the editor's minimum width.
+                if icon_button(ui, "\u{E1CA}", false, "Copy to clipboard  (Ctrl+C)").clicked() {
                     self.copy(now);
+                }
+                let busy = self.uploading.is_some();
+                let tip = if busy { "Uploading…" } else { "Upload with your edits and copy the link  (Ctrl+U)\nWhere to: Settings › Uploads" };
+                if icon_button(ui, "\u{E4C0}", busy, tip).clicked() {
+                    self.upload_image(ui.ctx(), now);
                 }
             });
         });
@@ -671,6 +728,9 @@ impl Editor {
                     self.selected = None;
                 }
             }
+        }
+        if cmd && pressed(egui::Key::U) {
+            self.upload_image(ctx, now);
         }
         if !cmd && pressed(egui::Key::X) {
             self.start_redact(ctx, now);
@@ -1226,6 +1286,7 @@ impl eframe::App for Editor {
         let ctx = ui.ctx().clone();
         let now = ctx.input(|i| i.time);
         self.poll_redact(now);
+        self.poll_upload(now);
         if let Some((dir, n)) = self.demo.clone() {
             if n == 0 {
                 if std::env::var_os("FRAMEGRAB_EDITOR_REDACT").is_some() {

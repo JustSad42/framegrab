@@ -23,9 +23,9 @@ In the overlay: `1`–`5` or `Tab` switch mode, arrow keys nudge the cursor by a
 Everything below is set once in Settings and then happens automatically:
 
 - Copy to the clipboard and/or save to `Pictures\Screenshots` as PNG, JPG, WebP (lossless) or AVIF, with a name template (`{date} {time} {app} {title} {mode} {w} {h}`) and optional per-app folders.
-- Window captures (click a window) grab the window's own pixels even if it's covered, with transparent rounded corners.
+- Window captures (click a window) grab the window's own pixels even if it's covered, with transparent rounded corners. Games and apps that Windows stretches for display scaling (e.g. League of Legends at 150%) are captured at full screen resolution, not as a small picture in a black frame.
 - Beautify: gradient background, padding, rounded corners and a shadow.
-- Optional upload to Imgur (your Client ID) or any ShareX-style endpoint, with the link copied. Off by default.
+- Optional upload to ImgBB (your API key), Imgur (your Client ID) or any ShareX-style endpoint, with the link copied. Off by default; every capture can upload automatically, or only when you press **Upload** on the card or in the editor (`Ctrl+U`, uploads your edits).
 - Optional shutter sound and screen flash.
 
 A small card offers **Edit**, **Text**, copy, **pin**, upload, show in folder and delete, and you can drag the thumbnail straight into Discord, a browser or Explorer.

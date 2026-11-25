@@ -618,7 +618,14 @@ fn toast_action(a: Action) {
             with(|a| a.last = None);
             toast::dismiss();
         }
-        Action::Upload => upload_last(),
+        Action::Upload => {
+            if with(|a| a.cfg.upload.provider == config::UploadProvider::Off).unwrap_or(true) {
+                toast::dismiss();
+                spawn_self(&["--settings", "--page", "uploads"]);
+            } else {
+                upload_last();
+            }
+        }
         Action::Close => toast::dismiss(),
     }
 }
@@ -896,7 +903,7 @@ fn handle_jobs() {
             Job::Ready { raw, thumb, size, path, status } => {
                 with(|a| a.last = Some((raw, path.clone())));
                 if cfg.show_toolbar && !cfg.open_editor {
-                    let upload = cfg.upload.provider != config::UploadProvider::Off && !cfg.upload.auto;
+                    let upload = !(cfg.upload.provider != config::UploadProvider::Off && cfg.upload.auto);
                     toast::show(host, Content::Image { thumb, size, status, upload }, path, cfg.toolbar_seconds);
                 }
             }

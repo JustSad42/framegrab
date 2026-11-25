@@ -51,10 +51,17 @@ pub fn run() {
             ui::install(&cc.egui_ctx);
             let cfg = Config::load();
             let paused = std::fs::read_to_string(crate::config::data_dir().join("status")).is_ok_and(|s| s.trim() == "paused");
-            Ok(Box::new(Settings { saved: cfg.clone(), cfg, langs: crate::ocr::languages(), snip_key: snip_key_setting(), update: None, frames: 0, paused, recording: None, page: 0, history: Vec::new(), thumbs: Default::default(), history_loaded: -10.0, history_status: None }))
+            Ok(Box::new(Settings { saved: cfg.clone(), cfg, langs: crate::ocr::languages(), snip_key: snip_key_setting(), update: None, frames: 0, paused, recording: None, page: start_page(), history: Vec::new(), thumbs: Default::default(), history_loaded: -10.0, history_status: None }))
         }),
     );
     recorder::stop();
+}
+
+/// `--settings --page uploads` opens on that page.
+fn start_page() -> usize {
+    let args: Vec<String> = std::env::args().collect();
+    let Some(want) = args.iter().position(|a| a == "--page").and_then(|i| args.get(i + 1)) else { return 0 };
+    PAGES.iter().position(|(_, name)| name.to_lowercase().starts_with(&want.to_lowercase())).unwrap_or(0)
 }
 
 /// Windows' own "Print Screen opens Snipping Tool" switch (None = not set).
@@ -674,9 +681,13 @@ impl Settings {
 
     fn uploads(&mut self, ui: &mut egui::Ui) {
         let u = &mut self.cfg.upload;
-        row(ui, "Upload to", |ui| segmented(ui, &mut u.provider, &[(UploadProvider::Off, "Off"), (UploadProvider::Imgur, "Imgur"), (UploadProvider::Custom, "Custom server")]));
+        row(ui, "Upload to", |ui| segmented(ui, &mut u.provider, &[(UploadProvider::Off, "Off"), (UploadProvider::ImgBB, "ImgBB"), (UploadProvider::Imgur, "Imgur"), (UploadProvider::Custom, "Custom server")]));
         match u.provider {
-            UploadProvider::Off => hint(ui, "Nothing leaves your PC. Turn on to get an Upload button on the card."),
+            UploadProvider::Off => hint(ui, "Nothing leaves your PC. Turn on to get an Upload button on the card and in the editor."),
+            UploadProvider::ImgBB => {
+                text_field(ui, "API key", &mut u.imgbb_key, "from api.imgbb.com", true);
+                hint(ui, "Sign in at imgbb.com, then copy your key from api.imgbb.com. Uploads are public to anyone with the link; the direct image link is copied.");
+            }
             UploadProvider::Imgur => {
                 text_field(ui, "Client ID", &mut u.imgur_client_id, "from api.imgur.com/oauth2/addclient", true);
                 hint(ui, "Register an app at imgur.com (\"anonymous usage\") to get a Client ID. Uploads are public to anyone with the link.");
@@ -690,7 +701,7 @@ impl Settings {
             }
         }
         if u.provider != UploadProvider::Off {
-            toggle(ui, &mut u.auto, "Upload every screenshot", "Otherwise only when you press Upload on the card");
+            toggle(ui, &mut u.auto, "Upload every screenshot", "Otherwise only when you press Upload on the card or in the editor");
             toggle(ui, &mut u.copy_link, "Copy the link when done", "Replaces the image on the clipboard with the URL");
         }
     }
