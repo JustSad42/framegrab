@@ -1,6 +1,6 @@
 [package]
 name = "framegrab"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 description = "A fast screenshot, text-grab and screen recording tool for Windows"
 license = "MIT"
