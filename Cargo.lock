@@ -885,7 +885,7 @@ dependencies = [
 
 [[package]]
 name = "framegrab"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "ab_glyph",
  "eframe",
