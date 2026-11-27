@@ -219,6 +219,10 @@ pub fn grab_monitors(mons: &[crate::capture::Monitor]) -> Option<Vec<Image>> {
         if !d.read(m.rect, &mut img) {
             return None;
         }
+        // A new duplication can hand out a blank first frame: let GDI take the shot.
+        if img.px.chunks_exact(4).all(|p| p[..3] == [0, 0, 0]) {
+            return None;
+        }
         out.push(img);
     }
     Some(out)
