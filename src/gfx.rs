@@ -209,6 +209,21 @@ pub enum Align {
     Right,
 }
 
+/// Rebuilds a lost window canvas. The old swap chain must be gone first: a window takes only one,
+/// and D3D11 defers destroying it until the context is flushed.
+pub fn recreate(slot: &mut Option<Canvas>, hwnd: HWND, w: u32, h: u32) {
+    use windows::Win32::Graphics::Direct3D11::ID3D11Device;
+    // `c` (and with it the swap chain) is dropped when this closure returns.
+    let old = slot.take().and_then(|c| c.swap.as_ref().and_then(|(s, _)| unsafe { s.GetDevice::<ID3D11Device>().ok() }));
+    if let Some(ctx) = old.and_then(|d| unsafe { d.GetImmediateContext().ok() }) {
+        unsafe {
+            ctx.ClearState();
+            ctx.Flush();
+        }
+    }
+    *slot = Canvas::new(hwnd, w, h);
+}
+
 /// A render target bound to a window (a flip-model swap chain on the shared GPU device) or an
 /// off-screen WIC bitmap, plus one reusable brush.
 pub struct Canvas {
@@ -464,5 +479,33 @@ mod icon_sheet {
         let px = c.pixels().unwrap();
         let dir = std::env::var("FRAMEGRAB_OUT").unwrap_or_else(|_| ".".into());
         crate::output::write_png(&std::path::Path::new(&dir).join("icons.png"), &px, true).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::UI::WindowsAndMessaging::*;
+
+    /// Needs a graphics device: `cargo test canvas_recreate -- --ignored`.
+    #[test]
+    #[ignore]
+    fn canvas_recreate() {
+        let h = crate::win::create("STATIC", "", WS_POPUP, WINDOW_EX_STYLE(0), 0, 0, 64, 64, None);
+        let mut c = Canvas::new(h, 64, 64);
+        assert!(c.is_some());
+        assert!(Canvas::new(h, 64, 64).is_none(), "a window takes only one swap chain");
+        // Same device, then a new one (as after a device loss).
+        recreate(&mut c, h, 64, 64);
+        assert!(c.is_some());
+        fact().drop_gpu();
+        recreate(&mut c, h, 64, 64);
+        assert!(c.is_some_and(|c| {
+            c.begin();
+            c.end()
+        }));
+        unsafe {
+            let _ = DestroyWindow(h);
+        }
     }
 }

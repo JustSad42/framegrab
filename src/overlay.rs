@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_U;
 use windows::Win32::Graphics::Direct2D::ID2D1Bitmap;
-use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT, ValidateRect};
+use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -378,8 +378,8 @@ impl Overlay {
         if !c.end() {
             // Device lost: rebuild the target and re-upload on the next paint.
             let w = &mut self.wins[i];
-            w.canvas = Canvas::new(w.hwnd, w.mon.w as u32, w.mon.h as u32);
             w.bmp = None;
+            crate::gfx::recreate(&mut w.canvas, w.hwnd, w.mon.w as u32, w.mon.h as u32);
             if let Some(s) = &self.s {
                 let img = s.shot.imgs[i].clone();
                 w.upload(&img);
@@ -822,8 +822,8 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
                         o.paint(i);
                     }
                 });
+                // No ValidateRect: it would cancel the repaint `paint` asks for after a rebuild.
                 let _ = EndPaint(h, &ps);
-                let _ = ValidateRect(Some(h), None);
                 LRESULT(0)
             }
             WM_ERASEBKGND => LRESULT(1),

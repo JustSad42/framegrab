@@ -124,7 +124,7 @@ fn paint(h: HWND) {
         c.stroke(0.5, 0.5, w as f32 - 1.0, hh as f32 - 1.0, if active { col::ACCENT } else { 0x40FFFFFF }, 1.0);
         if !c.end() {
             // Device lost: rebuild on the next paint.
-            p.canvas = Canvas::new(h, w, hh);
+            gfx::recreate(&mut p.canvas, h, w, hh);
             p.bmp = p.canvas.as_ref().and_then(|c| c.bitmap(p.img.w, p.img.h, &p.img.px));
             win::invalidate(h);
         }
