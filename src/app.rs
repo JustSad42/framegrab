@@ -641,11 +641,12 @@ fn trash(p: &std::path::Path) -> Result<(), String> {
     let mut op = SHFILEOPSTRUCTW {
         wFunc: FO_DELETE,
         pFrom: PCWSTR(from.as_ptr()),
-        fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI).0 as u16,
+        // NUKEWARNING: ask before a delete that can't be recycled (network or removable drive)
+        fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI | FOF_WANTNUKEWARNING).0 as u16,
         ..Default::default()
     };
     let r = unsafe { SHFileOperationW(&mut op) };
-    if r == 0 { Ok(()) } else { Err(format!("delete failed ({r})")) }
+    if r == 0 && !op.fAnyOperationsAborted.as_bool() { Ok(()) } else { Err(format!("delete failed ({r})")) }
 }
 
 trait WideVec {
