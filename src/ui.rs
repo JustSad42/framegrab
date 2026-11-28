@@ -206,3 +206,21 @@ mod icon_gen {
         std::fs::write("assets/icon.ico", ico).unwrap();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// The egui windows' clipboard (paste into text fields) reads what Windows has:
+    /// `cargo test --release clipboard_paste -- --ignored`. Restores the previous text.
+    #[test]
+    #[ignore]
+    fn clipboard_paste() {
+        let mut cb = unsafe { egui_winit::clipboard::Clipboard::new(None) };
+        let before = cb.get();
+        assert!(crate::output::copy_text("framegrab-paste-test-123"));
+        let got = cb.get();
+        if let Some(b) = before {
+            crate::output::copy_text(&b);
+        }
+        assert_eq!(got.as_deref(), Some("framegrab-paste-test-123"));
+    }
+}
